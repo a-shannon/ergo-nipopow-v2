@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  core-tests-and-certification:
+    name: Core Consensus Tests & Exact Rational 128-Bit Certification
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run exact rational 128-bit parameter certification
+        run: python3 scripts/certify_profiles.py
+
+      - name: Run core unit tests & adversarial negative suite
+        run: cargo test --release
+
+  cold-cpu-verify-mainnet-certificates:
+    name: Cold Zero-CUDA CPU Verification of Mainnet 128-Bit Certificates
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: host-aggregator
+
+      - name: Build CPU-only (zero-CUDA) verifier
+        run: |
+          cargo build --manifest-path host-aggregator/Cargo.toml --release --no-default-features
+          if ldd host-aggregator/target/release/ergo-nipopow-v2-aggregator | grep -qi cuda; then
+            echo "ERROR: CUDA dependency leaked into CPU-only verifier" >&2
+            exit 1
+          fi
+          echo "CPU_AGG_ZERO_CUDA_DEPS_OK"
+
+      - name: Download v0.2.0 mainnet release certificates & run cold CPU verification
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view v0.2.0 -R "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "INFO: Release v0.2.0 not published yet; skipping live release asset cold-verify."
+            exit 0
+          fi
+          mkdir -p release-assets
+          gh release download v0.2.0 -R "${{ github.repository }}" -D release-assets \
+            -p "ergo-mainnet-1827840-prod128-dual.npv2.bin" \
+            -p "ergo-mainnet-1827840-prod128-zisk-stir.npv2.bin" \
+            -p "tail-1819645-1827840.u32le" \
+            -p "root-agg.vk" \
+            -p "root-baseline.json" \
+            -p "SHA256SUMS.txt"
+          (cd release-assets && sha256sum --ignore-missing -c SHA256SUMS.txt)
+
+          AGG=host-aggregator/target/release/ergo-nipopow-v2-aggregator
+          ZISK_VK="2061927828237341284,1907988207398174607,15624447174404746195,12050011039068599532"
+
+          echo "=== Cold CPU verify: Heterogeneous Dual-Proof 128-bit certificate ==="
+          "$AGG" verify-cert \
+            --cert-bin release-assets/ergo-mainnet-1827840-prod128-dual.npv2.bin \
+            --root-agg-vk release-assets/root-agg.vk \
+            --root-baseline release-assets/root-baseline.json \
+            --zisk-root-vk "$ZISK_VK" \
+            --headers-u32le release-assets/tail-1819645-1827840.u32le \
+            --query-height 1823986
+
+          echo "=== Cold CPU verify: Standalone 128-bit ZisK STIR certificate ==="
+          "$AGG" verify-cert \
+            --cert-bin release-assets/ergo-mainnet-1827840-prod128-zisk-stir.npv2.bin \
+            --zisk-root-vk "$ZISK_VK" \
+            --headers-u32le release-assets/tail-1819645-1827840.u32le \
+            --query-height 1823986
