@@ -1,0 +1,71 @@
+name: Deploy Browser WASM Demo (GitHub Pages)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "crates/ergo-nipopow-v2-core/**"
+      - "crates/ergo-nipopow-v2-light/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build-pages:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build wasm32-unknown-unknown verifier (zero JS imports)
+        run: |
+          cargo build -p ergo-nipopow-v2-light --no-default-features --target wasm32-unknown-unknown --release
+          ls -lh target/wasm32-unknown-unknown/release/ergo_nipopow_v2_light.wasm
+
+      - name: Assemble static _site with verified v0.4.0 .gz release assets (same-origin)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p _site/assets
+          cp web/index.html web/nipopow-v2.js web/worker.js web/README.md _site/
+          touch _site/.nojekyll
+          cp target/wasm32-unknown-unknown/release/ergo_nipopow_v2_light.wasm _site/assets/
+          cp crates/ergo-nipopow-v2-light/testdata/extension_1827841_1827976.u32le _site/assets/
+          cp crates/ergo-nipopow-v2-light/testdata/mainnet_1827976_live_state_proof.json _site/assets/
+          gh release download v0.4.0 -R "${{ github.repository }}" -D _site/assets \
+            -p "ergo-mainnet-1827840-prod128-zisk-stir.npv2.bin.gz" \
+            -p "tail-1819645-1827840.u32le.gz" \
+            -p "SHA256SUMS.txt"
+          (cd _site/assets && sha256sum --ignore-missing -c SHA256SUMS.txt)
+          ls -lh _site _site/assets
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: "_site"
+
+  deploy-pages:
+    needs: build-pages
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

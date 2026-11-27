@@ -44,6 +44,7 @@
     <p class="sub">
       Strict 128-bit (<code>V2Production128</code>) trustless verification from genesis inside V8 WebAssembly
       (zero backend, zero prover SDK, zero JS imports, indefinite plain-header continuation).
+      <a href="https://github.com/a-shannon/ergo-nipopow-v2" style="color: var(--accent);">Source &amp; Reproducible VKs</a>
     </p>
 
     <section class="card">
@@ -105,17 +106,19 @@
 
     <section class="card">
       <h2>Execution Log</h2>
-      <pre id="log">Ready. Serve this folder with `python3 -m http.server 8080` or select local release files above.</pre>
+      <pre id="log">Ready. Click button 1 to cold-verify 1,827,840 Ergo mainnet headers inside WebAssembly (or select custom local files above).</pre>
     </section>
   </main>
 
   <script type="module">
     const LS_KEY = "ergo_nipopow_v2_checkpoint_v041";
+    const LS_BASE_KEY = "ergo_nipopow_v2_base_checkpoint_v041";
     const worker = new Worker("./worker.js", { type: "module" });
     let nextId = 1;
     const pending = new Map();
     let wasmReady = false;
     let checkpointJson = null;
+    let baseCheckpointJson = null;
     let lastExtBytes = null;
 
     const $ = (id) => document.getElementById(id);
@@ -152,15 +155,20 @@
       });
     }
 
-    async function loadInputOrFetch(fileInput, fallbackUrl) {
+    async function loadInputOrFetch(fileInput, fallbackUrls) {
       if (fileInput.files && fileInput.files[0]) {
         return new Uint8Array(await fileInput.files[0].arrayBuffer());
       }
-      const resp = await fetch(fallbackUrl);
-      if (!resp.ok) {
-        throw new Error(`Select a local file or place ${fallbackUrl} next to web/index.html (HTTP ${resp.status})`);
+      const urls = Array.isArray(fallbackUrls) ? fallbackUrls : [fallbackUrls];
+      let lastStatus = "network error";
+      for (const url of urls) {
+        const resp = await fetch(url);
+        if (resp.ok) {
+          return new Uint8Array(await resp.arrayBuffer());
+        }
+        lastStatus = `HTTP ${resp.status} for ${url}`;
       }
-      return new Uint8Array(await resp.arrayBuffer());
+      throw new Error(`Select a local file or host ${urls[0]} (${lastStatus})`);
     }
 
     async function ensureWasm() {
@@ -192,6 +200,8 @@
         const tailBytes = await loadInputOrFetch($("fTail"), "./assets/tail-1819645-1827840.u32le.gz");
         log(`Cold-verifying ${(certBytes.length / 1048576).toFixed(2)} MiB cert + ${(tailBytes.length / 1048576).toFixed(2)} MiB tail...`);
         const res = await callWorker("verifyCert", { certBytes, tailBytes, queryHeight: 1823986 });
+        baseCheckpointJson = res.checkpoint_json;
+        localStorage.setItem(LS_BASE_KEY, res.checkpoint_json);
         updateCheckpoint(res.checkpoint_json, {
           profile: res.profile,
           backend: res.backend,
@@ -213,6 +223,7 @@
       }
       try {
         await ensureWasm();
+        baseCheckpointJson = localStorage.getItem(LS_BASE_KEY) || saved;
         updateCheckpoint(saved, { profile: "V2Production128", backend: "Resumed LightCheckpoint" });
         setBadge("b1", "RESUMED", "ok");
         log("Resumed saved 5.6 KiB LightCheckpoint from localStorage (zero STARK download).");
@@ -223,6 +234,8 @@
 
     $("btnClear").onclick = () => {
       localStorage.removeItem(LS_KEY);
+      localStorage.removeItem(LS_BASE_KEY);
+      baseCheckpointJson = null;
       log("Cleared saved LightCheckpoint from localStorage.");
     };
 
@@ -246,10 +259,13 @@
     $("btnTamper").onclick = async () => {
       try {
         await ensureWasm();
-        const ext = lastExtBytes || await loadInputOrFetch($("fExt"), "../crates/ergo-nipopow-v2-light/testdata/extension_1827841_1827976.u32le");
+        const ext = lastExtBytes || await loadInputOrFetch($("fExt"), [
+          "./assets/extension_1827841_1827976.u32le",
+          "../crates/ergo-nipopow-v2-light/testdata/extension_1827841_1827976.u32le",
+        ]);
         const bad = new Uint8Array(ext);
         bad[bad.length - 1] ^= 0x01;
-        await callWorker("extendTail", { checkpointJson, extBytes: bad });
+        await callWorker("extendTail", { checkpointJson: baseCheckpointJson || checkpointJson, extBytes: bad });
         setBadge("b2", "BUG: ACCEPTED", "err");
         log("UNEXPECTED: tampered header accepted!");
       } catch (e) {
@@ -262,10 +278,20 @@
       try {
         setBadge("b3", "verifying...");
         await ensureWasm();
-        const extBytes = await loadInputOrFetch($("fExt"), "../crates/ergo-nipopow-v2-light/testdata/extension_1827841_1827976.u32le");
-        const fixtureBytes = await loadInputOrFetch($("fFix"), "../crates/ergo-nipopow-v2-light/testdata/mainnet_1827976_live_state_proof.json");
+        const extBytes = await loadInputOrFetch($("fExt"), [
+          "./assets/extension_1827841_1827976.u32le",
+          "../crates/ergo-nipopow-v2-light/testdata/extension_1827841_1827976.u32le",
+        ]);
+        const fixtureBytes = await loadInputOrFetch($("fFix"), [
+          "./assets/mainnet_1827976_live_state_proof.json",
+          "../crates/ergo-nipopow-v2-light/testdata/mainnet_1827976_live_state_proof.json",
+        ]);
         lastExtBytes = extBytes;
-        const res = await callWorker("verifyLiveStateProof", { checkpointJson, extBytes, fixtureBytes });
+        const res = await callWorker("verifyLiveStateProof", {
+          checkpointJson: baseCheckpointJson || checkpointJson,
+          extBytes,
+          fixtureBytes,
+        });
         setBadge("b3", "AVL+ VERIFIED", "ok");
         log(`LIVE_STATE_PROOF_PASS: h=${res.live_height} ad_bytes=${res.ad_bytes} spent=${res.spent_count} created=${res.created_count} avl=${res.prev_state_root.slice(0, 12)}..->${res.next_state_root.slice(0, 12)}.. tx_merkle=${res.tx_merkle_verified} in ${res.elapsedMs.toFixed(1)} ms`);
       } catch (e) {

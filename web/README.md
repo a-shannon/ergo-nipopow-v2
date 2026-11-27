@@ -1,5 +1,7 @@
 # Zero-Backend Browser WebAssembly Light Client (`web/`)
 
+**Live Demo:** https://a-shannon.github.io/ergo-nipopow-v2/ (automatically built from source and deployed via `.github/workflows/pages.yml` with the verified `v0.4.0` `.gz` release assets served same-origin).
+
 Run Ergo NiPoPoW V2 (`V2Production128`) directly in any modern browser with **zero npm packages, zero bundler, zero backend server, and zero prover SDK**.
 
 ## Quickstart

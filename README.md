@@ -5,6 +5,7 @@
 A. Shannon · 27 November 2026 · MIT OR Apache-2.0
 
 [![CI](https://github.com/a-shannon/ergo-nipopow-v2/actions/workflows/ci.yml/badge.svg)](https://github.com/a-shannon/ergo-nipopow-v2/actions/workflows/ci.yml)
+[![Live Browser WASM Demo](https://img.shields.io/badge/Live%20Demo-Browser%20WASM%20Light%20Client-ff5e18)](https://a-shannon.github.io/ergo-nipopow-v2/)
 
 ---
 
@@ -21,7 +22,7 @@ All **1,827,840 canonical Ergo mainnet headers** (tip `20ed709e5e9ba0d40fa941b2d
 
 - **Strict `V2Production128` Profile Enforcement & Standalone OpenVM Guard (Issue #2):** Both `ergo-nipopow-v2-light` (native CLI, WASM, `compare-certs`) and `host-aggregator` (`verify-cert`, `assemble-zisk-cert`, `assemble-dual-cert`) now enforce `cert.statement.profile == ProfileId::V2Production128` fail-closed (preventing profile-downgrade certificates) and report `profile=V2Production128` explicitly. `host-aggregator verify-cert` also refuses standalone `OpenVmSwirlV21` by default unless `--allow-non-128-standalone-openvm` is explicitly passed, documenting OpenVM `v2.1.0`'s 100-bit proven RBR security level transparently.
 - **Conservative Exact-Rational Reporting (`scripts/certify_profiles.py`):** Exponents are now conservatively truncated toward zero (never rounded toward stronger security), explicitly reporting `eps_early = (2^80 + 1)·(1/2 + 2^-37)^210 = 2^-130 · (1 + 3.06e-9) <= 2^-129.99` while confirming `union(5) <= 2^-128.35 < 2^-128` and conservative `union(6) <= 2^-128.13 < 2^-128`.
-- **Zero-Backend Live Browser WASM Demo (`web/`):** Self-contained HTML + ES module (`web/index.html`, `web/nipopow-v2.js`, `web/worker.js`) executing `ergo_nipopow_v2_light.wasm` (`816.9 KiB` gzip-9, zero npm) in a browser Web Worker, with live plain-header `extend-tail` syncing directly against any public Ergo node REST API up to the current mainnet tip and trustless AVL+ `ADProofs` verification.
+- **Zero-Backend Live Browser WASM Demo (`web/` — [Try Live on GitHub Pages](https://a-shannon.github.io/ergo-nipopow-v2/)):** Self-contained HTML + ES module (`web/index.html`, `web/nipopow-v2.js`, `web/worker.js`) executing `ergo_nipopow_v2_light.wasm` (`816.9 KiB` gzip-9, zero npm) in a browser Web Worker, with live plain-header `extend-tail` syncing directly against any public Ergo node REST API up to the current mainnet tip and trustless AVL+ `ADProofs` verification.
 - **Ergo Node Transport EIP Draft (`docs/EIP-NIPOPOW-V2-TRANSPORT.md`):** Read-only REST and P2P specification for serving `(V2Certificate, exact_tail)` bundles and frozen L1 archives from Ergo nodes with zero consensus changes.
 
 ### Highlights from `v0.4.0` (100% Reproducible Dual-Proof Snapshot, Executable V8 WASM, Live Post-STARK `1,827,976` `ADProofs` & Untrusted Multi-Peer Fork Selection)
