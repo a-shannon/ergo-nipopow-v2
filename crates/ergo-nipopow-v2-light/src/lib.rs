@@ -18,7 +18,7 @@ use ergo_nipopow_v2_core::certificate::{
     select_best, AdmittedCandidate, DualStructuralProof, StructuralBackend, V2Certificate,
     CERT_MAGIC,
 };
-use ergo_nipopow_v2_core::header::blake2b256;
+use ergo_nipopow_v2_core::header::{blake2b256, Header};
 use ergo_nipopow_v2_core::mmr::sha256_bytes;
 use ergo_nipopow_v2_core::profile::ProfileId;
 use ergo_nipopow_v2_core::state_proof::ErgoTxMerkleProof;
@@ -280,6 +280,27 @@ pub fn verify_block_ad_proofs(
     spent_box_ids: &[[u8; 32]],
     created_boxes: &[([u8; 32], Vec<u8>)],
 ) -> Result<[u8; 33], LightError> {
+    verify_block_ad_proofs_with_lookups(
+        prev_header,
+        curr_header,
+        ad_proofs_bytes,
+        &[],
+        spent_box_ids,
+        created_boxes,
+    )
+}
+
+/// Consensus-exact Ergo AVL+ `ADProofs` verifier matching `ErgoState.stateChanges` /
+/// `StateChanges.operations` (`toLookup ++ toRemove ++ toAppend`), supporting full
+/// multi-transaction blocks with `dataInputs` lookups and intra-block spend cancellation.
+pub fn verify_block_ad_proofs_with_lookups(
+    prev_header: &CertifiedHeaderSummary,
+    curr_header: &CertifiedHeaderSummary,
+    ad_proofs_bytes: &[u8],
+    lookup_box_ids: &[[u8; 32]],
+    spent_box_ids: &[[u8; 32]],
+    created_boxes: &[([u8; 32], Vec<u8>)],
+) -> Result<[u8; 33], LightError> {
     if curr_header.height != prev_header.height + 1 || curr_header.parent_id != prev_header.id {
         return Err(LightError::AvlProof(
             "curr_header is not direct child of prev_header".into(),
@@ -306,7 +327,7 @@ pub fn verify_block_ad_proofs(
 
     let start_digest = Bytes::copy_from_slice(&prev_header.state_root);
     let proof_buf = Bytes::copy_from_slice(ad_proofs_bytes);
-    let total_ops = spent_box_ids.len() + created_boxes.len();
+    let total_ops = lookup_box_ids.len() + spent_box_ids.len() + created_boxes.len();
     fn verifier_resolver(digest: &[u8; 32]) -> ergo_avltree_rust::batch_node::Node {
         ergo_avltree_rust::batch_node::Node::LabelOnly(
             ergo_avltree_rust::batch_node::NodeHeader::new(Some(*digest), None),
@@ -322,6 +343,11 @@ pub fn verify_block_ad_proofs(
     )
     .map_err(|e| LightError::AvlProof(format!("reconstruct_tree failed: {e}")))?;
 
+    for data_input in lookup_box_ids {
+        verifier
+            .perform_one_operation(&Operation::Lookup(Bytes::copy_from_slice(data_input)))
+            .map_err(|e| LightError::AvlProof(format!("AVL Lookup failed: {e}")))?;
+    }
     for spent in spent_box_ids {
         verifier
             .perform_one_operation(&Operation::Remove(Bytes::copy_from_slice(spent)))
@@ -349,6 +375,108 @@ pub fn verify_block_ad_proofs(
     let mut out = [0u8; 33];
     out.copy_from_slice(final_digest.as_ref());
     Ok(out)
+}
+
+/// Verified state & transaction inclusion result for any certified block `H <= checkpoint.tip_height`.
+#[derive(Clone, Debug)]
+pub struct VerifiedCheckpointBlockState {
+    pub height: u32,
+    pub block_id: [u8; 32],
+    pub prev_state_root: [u8; 33],
+    pub next_state_root: [u8; 33],
+    pub header_chain_len: usize,
+    pub ad_bytes: usize,
+    pub lookup_count: usize,
+    pub spent_count: usize,
+    pub created_count: usize,
+    pub tx_merkle_verified: bool,
+}
+
+/// Trustlessly verify ANY certified block `H <= checkpoint.tip_height` directly against
+/// a verified `V2Production128` `LightCheckpoint` using a descending raw Scorex header
+/// chain `[tip_height, tip_height - 1, ..., H, H - 1]` authenticated by BLAKE2b-256
+/// parent hashes back from `checkpoint.tip_id`, plus the block's `ADProofs` and optional
+/// Scorex transaction Merkle inclusion proof.
+pub fn verify_checkpoint_block_state(
+    checkpoint: &LightCheckpoint,
+    header_chain_desc_u32le: &[u8],
+    ad_proofs_bytes: &[u8],
+    lookup_box_ids: &[[u8; 32]],
+    spent_box_ids: &[[u8; 32]],
+    created_boxes: &[([u8; 32], Vec<u8>)],
+    tx_proof: Option<&ErgoTxMerkleProof>,
+) -> Result<VerifiedCheckpointBlockState, LightError> {
+    if checkpoint.bootstrap.profile != ProfileId::V2Production128 {
+        return Err(LightError::UnsupportedProfile(checkpoint.bootstrap.profile));
+    }
+    let raw_headers = decode_u32le_headers(header_chain_desc_u32le)?;
+    if raw_headers.len() < 2 {
+        return Err(LightError::Tail(
+            "header_chain_desc must contain at least 2 headers ([tip, tip-1])".into(),
+        ));
+    }
+
+    let mut summaries: Vec<CertifiedHeaderSummary> = Vec::with_capacity(raw_headers.len());
+    for (idx, raw) in raw_headers.iter().enumerate() {
+        let expected_id = if idx == 0 {
+            checkpoint.tip_id
+        } else {
+            summaries[idx - 1].parent_id
+        };
+        let (parsed, _) = Header::decode_native(raw, Some(&expected_id))
+            .map_err(|e| LightError::Tail(format!("header[{idx}] decode/id check failed: {e:?}")))?;
+        let id = expected_id;
+        if idx == 0 {
+            if parsed.height != checkpoint.tip_height {
+                return Err(LightError::Tail(format!(
+                    "header[0] height {} does not match certified checkpoint tip {}",
+                    parsed.height, checkpoint.tip_height
+                )));
+            }
+        } else {
+            let child: &CertifiedHeaderSummary = &summaries[idx - 1];
+            if parsed.height + 1 != child.height {
+                return Err(LightError::Tail(format!(
+                    "header[{idx}] height {} does not precede child height {}",
+                    parsed.height, child.height
+                )));
+            }
+        }
+        summaries.push(CertifiedHeaderSummary::from_header(&parsed, id));
+    }
+
+    let n = summaries.len();
+    let curr_hdr = &summaries[n - 2];
+    let prev_hdr = &summaries[n - 1];
+
+    let next_state_root = verify_block_ad_proofs_with_lookups(
+        prev_hdr,
+        curr_hdr,
+        ad_proofs_bytes,
+        lookup_box_ids,
+        spent_box_ids,
+        created_boxes,
+    )?;
+
+    let tx_merkle_verified = if let Some(proof) = tx_proof {
+        verify_tx_inclusion(curr_hdr, proof)?;
+        true
+    } else {
+        false
+    };
+
+    Ok(VerifiedCheckpointBlockState {
+        height: curr_hdr.height,
+        block_id: curr_hdr.id,
+        prev_state_root: prev_hdr.state_root,
+        next_state_root,
+        header_chain_len: n,
+        ad_bytes: ad_proofs_bytes.len(),
+        lookup_count: lookup_box_ids.len(),
+        spent_count: spent_box_ids.len(),
+        created_count: created_boxes.len(),
+        tx_merkle_verified,
+    })
 }
 
 /// Verify an Ergo transaction Merkle membership proof against a certified header's `transactions_root`.
@@ -738,5 +866,113 @@ mod tests {
             LightError::UnsupportedProfile(ProfileId::V2Production) => {}
             other => panic!("expected UnsupportedProfile(V2Production), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn checkpoint_block_state_verifies_and_rejects_tampered_chain() {
+        let ckpt_1827840: LightCheckpoint =
+            serde_json::from_str(include_str!("../testdata/checkpoint_1827840.json")).unwrap();
+        let ext_bytes: &[u8] = include_bytes!("../testdata/extension_1827841_1827976.u32le");
+        let (ckpt_1827976, _hdrs) = extend_light_checkpoint_bytes(&ckpt_1827840, ext_bytes).unwrap();
+        assert_eq!(ckpt_1827976.tip_height, 1_827_976);
+
+        // Extract descending 2-header chain [1827976, 1827975] from extension_1827841_1827976.u32le
+        let raw_hdrs = decode_u32le_headers(ext_bytes).unwrap();
+        let h_1827976 = &raw_hdrs[raw_hdrs.len() - 1];
+        let h_1827975 = &raw_hdrs[raw_hdrs.len() - 2];
+        let mut chain_desc = Vec::new();
+        chain_desc.extend_from_slice(&(h_1827976.len() as u32).to_le_bytes());
+        chain_desc.extend_from_slice(h_1827976);
+        chain_desc.extend_from_slice(&(h_1827975.len() as u32).to_le_bytes());
+        chain_desc.extend_from_slice(h_1827975);
+
+        let fix: serde_json::Value = serde_json::from_str(include_str!(
+            "../testdata/mainnet_1827976_live_state_proof.json"
+        ))
+        .unwrap();
+        let ad_bytes = hex::decode(fix["ad_proofs_hex"].as_str().unwrap()).unwrap();
+        let spent: Vec<[u8; 32]> = fix["spent_box_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| hex::decode(v.as_str().unwrap()).unwrap().try_into().unwrap())
+            .collect();
+        let created: Vec<([u8; 32], Vec<u8>)> = fix["created_boxes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| {
+                let id: [u8; 32] = hex::decode(v["box_id"].as_str().unwrap())
+                    .unwrap()
+                    .try_into()
+                    .unwrap();
+                let raw = hex::decode(v["raw_bytes_hex"].as_str().unwrap()).unwrap();
+                (id, raw)
+            })
+            .collect();
+        let mp = &fix["merkle_tx_proof"];
+        let tx_proof = ErgoTxMerkleProof {
+            leaf_data: hex::decode(mp["leafData"].as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            levels: mp["levels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|pair| {
+                    let h: [u8; 32] = hex::decode(pair[0].as_str().unwrap())
+                        .unwrap()
+                        .try_into()
+                        .unwrap();
+                    let s = pair[1].as_u64().unwrap() as u8;
+                    (h, s)
+                })
+                .collect(),
+        };
+
+        let ok = verify_checkpoint_block_state(
+            &ckpt_1827976,
+            &chain_desc,
+            &ad_bytes,
+            &[],
+            &spent,
+            &created,
+            Some(&tx_proof),
+        )
+        .expect("genuine checkpoint block state must verify");
+        assert_eq!(ok.height, 1_827_976);
+        assert_eq!(ok.header_chain_len, 2);
+        assert!(ok.tx_merkle_verified);
+
+        // Tamper 1 bit in header[0] -> must reject because BLAKE2b(header[0]) != ckpt.tip_id
+        let mut bad_chain = chain_desc.clone();
+        bad_chain[10] ^= 0x01;
+        assert!(verify_checkpoint_block_state(
+            &ckpt_1827976,
+            &bad_chain,
+            &ad_bytes,
+            &[],
+            &spent,
+            &created,
+            Some(&tx_proof),
+        )
+        .is_err());
+
+        // Downgraded profile checkpoint -> must reject fail-closed
+        let mut bad_ckpt = ckpt_1827976.clone();
+        bad_ckpt.bootstrap.profile = ProfileId::V2Production;
+        assert!(matches!(
+            verify_checkpoint_block_state(
+                &bad_ckpt,
+                &chain_desc,
+                &ad_bytes,
+                &[],
+                &spent,
+                &created,
+                Some(&tx_proof),
+            ),
+            Err(LightError::UnsupportedProfile(ProfileId::V2Production))
+        ));
     }
 }

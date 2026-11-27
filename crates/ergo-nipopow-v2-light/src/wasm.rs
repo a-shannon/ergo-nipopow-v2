@@ -8,8 +8,8 @@ use ergo_nipopow_v2_core::state_proof::ErgoTxMerkleProof;
 use ergo_nipopow_v2_core::tail::LightCheckpoint;
 
 use crate::{
-    extend_light_checkpoint_bytes, verify_block_ad_proofs, verify_light_certificate,
-    verify_tx_inclusion, PINNED_ZISK_ROOT_VK_PROD128,
+    extend_light_checkpoint_bytes, verify_block_ad_proofs, verify_checkpoint_block_state,
+    verify_light_certificate, verify_tx_inclusion, PINNED_ZISK_ROOT_VK_PROD128,
 };
 
 thread_local! {
@@ -315,6 +315,140 @@ pub unsafe extern "C" fn wasm_verify_live_state_proof(
         spent_count: spent.len(),
         created_count: created.len(),
         tx_merkle_verified: true,
+    };
+    match serde_json::to_vec(&out) {
+        Ok(v) => {
+            set_output(v);
+            0
+        }
+        Err(e) => set_err(e.to_string()),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct WasmCheckpointBlockInput {
+    ad_proofs_hex: String,
+    #[serde(default)]
+    lookup_box_ids: Vec<String>,
+    spent_box_ids: Vec<String>,
+    created_boxes: Vec<WasmCreatedBox>,
+    merkle_tx_proof: Option<WasmMerkleProof>,
+}
+
+#[derive(serde::Serialize)]
+struct WasmCheckpointBlockOutput {
+    height: u32,
+    block_id: String,
+    tip_height: u32,
+    header_chain_len: usize,
+    prev_state_root: String,
+    next_state_root: String,
+    ad_bytes: usize,
+    lookup_count: usize,
+    spent_count: usize,
+    created_count: usize,
+    tx_merkle_verified: bool,
+}
+
+/// Verify ANY certified block `H <= checkpoint.tip_height` directly against a verified
+/// `V2Production128` `LightCheckpoint` inside WASM, using a descending raw header chain
+/// `[tip_height, ..., H, H - 1]` authenticated by BLAKE2b-256 back from `checkpoint.tip_id`,
+/// full multi-tx `ADProofs` (including `dataInputs` lookups + intra-block cancellation),
+/// and optional Scorex transaction Merkle inclusion proof.
+#[no_mangle]
+pub unsafe extern "C" fn wasm_verify_checkpoint_block_state(
+    ckpt_ptr: *const u8,
+    ckpt_len: usize,
+    chain_ptr: *const u8,
+    chain_len: usize,
+    block_json_ptr: *const u8,
+    block_json_len: usize,
+) -> i32 {
+    let ckpt_bytes = slice_from_raw(ckpt_ptr, ckpt_len);
+    let chain_bytes = slice_from_raw(chain_ptr, chain_len);
+    let block_bytes = slice_from_raw(block_json_ptr, block_json_len);
+
+    let ckpt: LightCheckpoint = match serde_json::from_slice(ckpt_bytes) {
+        Ok(c) => c,
+        Err(e) => return set_err(format!("checkpoint json: {e}")),
+    };
+    let inp: WasmCheckpointBlockInput = match serde_json::from_slice(block_bytes) {
+        Ok(v) => v,
+        Err(e) => return set_err(format!("block proof json: {e}")),
+    };
+    let ad_bytes = match hex::decode(&inp.ad_proofs_hex) {
+        Ok(b) => b,
+        Err(e) => return set_err(format!("ad_proofs_hex: {e}")),
+    };
+    let mut lookups = Vec::with_capacity(inp.lookup_box_ids.len());
+    for s in &inp.lookup_box_ids {
+        match hex32(s) {
+            Ok(id) => lookups.push(id),
+            Err(e) => return set_err(e),
+        }
+    }
+    let mut spent = Vec::with_capacity(inp.spent_box_ids.len());
+    for s in &inp.spent_box_ids {
+        match hex32(s) {
+            Ok(id) => spent.push(id),
+            Err(e) => return set_err(e),
+        }
+    }
+    let mut created = Vec::with_capacity(inp.created_boxes.len());
+    for b in &inp.created_boxes {
+        let id = match hex32(&b.box_id) {
+            Ok(v) => v,
+            Err(e) => return set_err(e),
+        };
+        let raw = match hex::decode(&b.raw_bytes_hex) {
+            Ok(v) => v,
+            Err(e) => return set_err(e.to_string()),
+        };
+        created.push((id, raw));
+    }
+    let tx_proof = match inp.merkle_tx_proof {
+        Some(mp) => {
+            let leaf_data = match hex32(&mp.leaf_data) {
+                Ok(v) => v,
+                Err(e) => return set_err(e),
+            };
+            let mut levels = Vec::with_capacity(mp.levels.len());
+            for (h, side) in &mp.levels {
+                match hex32(h) {
+                    Ok(v) => levels.push((v, *side)),
+                    Err(e) => return set_err(e),
+                }
+            }
+            Some(ErgoTxMerkleProof { leaf_data, levels })
+        }
+        None => None,
+    };
+
+    let res = match verify_checkpoint_block_state(
+        &ckpt,
+        chain_bytes,
+        &ad_bytes,
+        &lookups,
+        &spent,
+        &created,
+        tx_proof.as_ref(),
+    ) {
+        Ok(v) => v,
+        Err(e) => return set_err(e.to_string()),
+    };
+
+    let out = WasmCheckpointBlockOutput {
+        height: res.height,
+        block_id: hex::encode(res.block_id),
+        tip_height: ckpt.tip_height,
+        header_chain_len: res.header_chain_len,
+        prev_state_root: hex::encode(res.prev_state_root),
+        next_state_root: hex::encode(res.next_state_root),
+        ad_bytes: res.ad_bytes,
+        lookup_count: res.lookup_count,
+        spent_count: res.spent_count,
+        created_count: res.created_count,
+        tx_merkle_verified: res.tx_merkle_verified,
     };
     match serde_json::to_vec(&out) {
         Ok(v) => {

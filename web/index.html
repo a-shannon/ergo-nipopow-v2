@@ -90,17 +90,26 @@
     </section>
 
     <section class="card">
-      <h2>3. Trustless Live Post-STARK Block 1,827,976 AVL+ ADProofs &amp; Tx Merkle <span id="b3" class="badge">idle</span></h2>
+      <h2>3. Trustless Live Block AVL+ ADProofs &amp; Tx Merkle (Any Certified Height) <span id="b3" class="badge">idle</span></h2>
       <div class="row">
-        <label>Post-STARK headers (<code>extension_1827841_1827976.u32le</code>)
-          <input id="fExt" type="file" />
+        <label>Live block height to verify (0 = current certified tip)
+          <input id="liveBlockHeight" type="number" value="0" min="0" step="1" />
         </label>
-        <label>State proof fixture (<code>mainnet_1827976_live_state_proof.json</code>)
-          <input id="fFix" type="file" accept=".json" />
+        <label>Tx index or 64-hex txId (optional, default 0)
+          <input id="liveTxSel" type="text" value="0" />
         </label>
       </div>
       <div class="row">
-        <button id="btnAdProof" disabled>Verify Real Block 1,827,976 ADProofs &amp; Tx Merkle in WASM</button>
+        <button id="btnLiveBlock" disabled>Fetch &amp; Verify Live Block ADProofs + Tx Merkle from Ergo Node</button>
+        <button id="btnAdProof" class="secondary" disabled>Verify Bundled Block 1,827,976 Offline Fixture</button>
+      </div>
+      <div class="row">
+        <label>Optional offline extension (<code>extension_1827841_1827976.u32le</code>)
+          <input id="fExt" type="file" />
+        </label>
+        <label>Optional offline fixture (<code>mainnet_1827976_live_state_proof.json</code>)
+          <input id="fFix" type="file" accept=".json" />
+        </label>
       </div>
     </section>
 
@@ -188,6 +197,7 @@
       if (meta.profile) $("vProf").textContent = `${meta.profile} / ${meta.backend}`;
       if (meta.perf) $("vPerf").textContent = meta.perf;
       $("btnLive").disabled = false;
+      $("btnLiveBlock").disabled = false;
       $("btnAdProof").disabled = false;
       $("btnTamper").disabled = false;
     }
@@ -271,6 +281,31 @@
       } catch (e) {
         setBadge("b2", "TAMPER REJECTED", "ok");
         log(`FAIL-CLOSED TAMPER REJECTED OK: ${e.message}`);
+      }
+    };
+
+    $("btnLiveBlock").onclick = async () => {
+      try {
+        setBadge("b3", "fetching & verifying...");
+        await ensureWasm();
+        const nodeUrl = $("nodeUrl").value.trim();
+        const targetHeight = parseInt($("liveBlockHeight").value, 10) || 0;
+        const txRaw = $("liveTxSel").value.trim();
+        const txSelector = txRaw.length === 64 ? txRaw : (parseInt(txRaw, 10) || 0);
+        const cp = JSON.parse(checkpointJson);
+        const hLabel = targetHeight > 0 ? targetHeight : cp.tip_height;
+        log(`Fetching live block ${hLabel} ADProofs + txs + Tx Merkle proof from ${nodeUrl}...`);
+        const res = await callWorker("verifyLiveBlockFromNode", {
+          nodeUrl,
+          checkpointJson,
+          targetHeight,
+          txSelector,
+        });
+        setBadge("b3", `LIVE #${res.height} VERIFIED`, "ok");
+        log(`LIVE_NODE_BLOCK_ADPROOFS_PASS: h=${res.height} (chain=${res.header_chain_len} hdrs from tip ${res.tip_height}) txs=${res.tx_count} ad_bytes=${res.ad_bytes} lookups=${res.lookup_count} spent=${res.spent_count} created=${res.created_count} avl=${res.prev_state_root.slice(0, 12)}..->${res.next_state_root.slice(0, 12)}.. tx=${(res.tx_id || "").slice(0, 12)}.. merkle=${res.tx_merkle_verified} in ${res.elapsedMs.toFixed(1)} ms`);
+      } catch (e) {
+        setBadge("b3", "FAILED", "err");
+        log(`ERROR: ${e.message}`);
       }
     };
 

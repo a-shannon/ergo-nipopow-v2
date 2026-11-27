@@ -1,10 +1,13 @@
-# EIP-Draft: Opt-In Read-Only Node Transport for Ergo NiPoPoW V2 Certificates
+# Opt-In Read-Only Node Transport for Ergo NiPoPoW V2 Certificates
 
-* **Status:** Draft (Community Proposal)
-* **Category:** Interface / Networking (Zero Consensus Change)
-* **Author:** A. Shannon
-* **Created:** 2026-11-27
-* **Reference Implementation:** `a-shannon/ergo-nipopow-v2` (`v0.4.1`)
+- Author: A. Shannon
+- Status: Proposed
+- Created: 27-November-2026
+- Last edited: 27-November-2026
+- License: CC0
+- Forking: not needed
+- Reference Implementation: `https://github.com/a-shannon/ergo-nipopow-v2` (`v0.4.2`)
+- Live Browser WASM Demo: `https://a-shannon.github.io/ergo-nipopow-v2/`
 
 ---
 
@@ -97,7 +100,11 @@ Returns lightweight JSON metadata describing the locally cached snapshot(s) and 
 No new endpoint is required to sync past `snapshotTipHeight`:
 1. Client fetches JSON headers from `snapshotTipHeight + 1` up to `nodeFullHeight` in chunks of up to `256` headers via the existing Ergo node endpoint `GET /blocks/chainSlice?fromHeight=<h1>&toHeight=<h2`.
 2. Client encodes each header into canonical Scorex binary form (`u32le` stream) and feeds it to `extend-tail` / `wasm_extend_tail`, which recomputes every `BLAKE2b-256` header ID, validates parent links, strict timestamps, EIP-37 DAA retargets, and native Autolykos v2 PoW.
-3. For any UTXO balance or transaction check at height `h`, client fetches `GET /blocks/<headerId>/proofFor` (or `/blocks/<headerId>/adProofs`) and `/blocks/<headerId>/transactions` from any untrusted node and verifies the AVL+ state transition and Scorex Tx Merkle proof locally against the certified `stateRoot` and `transactionsRoot`.
+3. For any UTXO balance or transaction check at any certified height `h <= tipHeight`, client fetches:
+   - the minimal descending raw header chain `[tipHeight, ..., h, h - 1]` (just 2 headers = `448 B` when `h == tipHeight`), authenticated backwards via `BLAKE2b-256` parent hashes from `checkpoint.tip_id`,
+   - `GET /blocks/<headerId>` (`adProofs.proofBytes` + `blockTransactions.transactions`), extracting exact `StateChanges` (`toLookup ++ toRemove ++ toAppend` matching `ErgoState.stateChanges` / `boxChanges`, including `dataInputs` lookups and intra-block spend cancellation), and
+   - `GET /blocks/<headerId>/proofFor/<txId>` (Scorex transaction Merkle inclusion proof).
+   All three checks execute locally inside WebAssembly (`wasm_verify_checkpoint_block_state`, ~`1.4–1.9 ms` on live multi-tx mainnet blocks with `10–39 KiB` `ADProofs`).
 
 ---
 

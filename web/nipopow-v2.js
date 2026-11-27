@@ -20,6 +20,170 @@ export function hexToBytes(hex) {
   return out;
 }
 
+export function bytesToHex(bytes) {
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) {
+    out += bytes[i].toString(16).padStart(2, "0");
+  }
+  return out;
+}
+
+function concatBytes(parts) {
+  let total = 0;
+  for (const p of parts) total += p.length;
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) {
+    out.set(p, off);
+    off += p.length;
+  }
+  return out;
+}
+
+/**
+ * Canonically serialize an Ergo node output JSON object into exact Scorex
+ * `ErgoBoxSerializer` wire bytes (`BLAKE2b-256(bytes) === output.boxId`).
+ */
+export function encodeErgoBoxJson(o) {
+  const parts = [
+    encodeVlqUint(BigInt(o.value)),
+    hexToBytes(o.ergoTree),
+    encodeVlqUint(BigInt(o.creationHeight)),
+    encodeVlqUint(BigInt((o.assets || []).length)),
+  ];
+  for (const a of o.assets || []) {
+    parts.push(hexToBytes(a.tokenId), encodeVlqUint(BigInt(a.amount)));
+  }
+  const regs = o.additionalRegisters || {};
+  const regKeys = Object.keys(regs).sort();
+  parts.push(new Uint8Array([regKeys.length]));
+  for (const k of regKeys) {
+    parts.push(hexToBytes(regs[k]));
+  }
+  parts.push(hexToBytes(o.transactionId), encodeVlqUint(BigInt(o.index)));
+  return concatBytes(parts);
+}
+
+/**
+ * Extract consensus-exact Ergo `StateChanges` (`toLookup ++ toRemove ++ toAppend`)
+ * matching `org.ergoplatform.nodeView.state.ErgoState.stateChanges` / `boxChanges`
+ * (including intra-block spend cancellation and lexicographical `boxId` sorting).
+ */
+export function extractBlockStateChanges(blockJson) {
+  const txs = blockJson?.blockTransactions?.transactions || [];
+  const toRemove = new Map();
+  const toInsert = new Map();
+  const lookupBoxIds = [];
+  for (const tx of txs) {
+    for (const di of tx.dataInputs || []) {
+      lookupBoxIds.push(di.boxId.toLowerCase());
+    }
+    for (const inp of tx.inputs || []) {
+      const id = inp.boxId.toLowerCase();
+      if (toInsert.has(id)) {
+        toInsert.delete(id);
+      } else {
+        toRemove.set(id, true);
+      }
+    }
+    for (const out of tx.outputs || []) {
+      const id = out.boxId.toLowerCase();
+      toInsert.set(id, { box_id: id, raw_bytes_hex: bytesToHex(encodeErgoBoxJson(out)) });
+    }
+  }
+  const spentBoxIds = Array.from(toRemove.keys()).sort();
+  const createdBoxes = Array.from(toInsert.keys())
+    .sort()
+    .map((id) => toInsert.get(id));
+  return {
+    ad_proofs_hex: blockJson?.adProofs?.proofBytes || "",
+    lookup_box_ids: lookupBoxIds,
+    spent_box_ids: spentBoxIds,
+    created_boxes: createdBoxes,
+    tx_count: txs.length,
+    tx_ids: txs.map((t) => t.id),
+  };
+}
+
+/**
+ * Fetch a live Ergo block's descending header proof chain `[tip, ..., target, target - 1]`,
+ * real `ADProofs`, full `StateChanges` (including `dataInputs` & intra-block spends), and
+ * Scorex transaction Merkle inclusion proof from any untrusted Ergo node REST API.
+ */
+export async function fetchLiveBlockProofBundle(
+  nodeUrl,
+  checkpointTipHeight,
+  targetHeight,
+  txSelector = 0
+) {
+  const base = nodeUrl.replace(/\/+$/, "");
+  if (targetHeight > checkpointTipHeight) {
+    throw new Error(
+      `Target height ${targetHeight} is ahead of certified checkpoint tip ${checkpointTipHeight}. Sync headers first.`
+    );
+  }
+  if (targetHeight < 2) {
+    throw new Error(`Target height must be >= 2, got ${targetHeight}`);
+  }
+  if (checkpointTipHeight - targetHeight > 1024) {
+    throw new Error(
+      `Target height ${targetHeight} is more than 1,024 blocks behind tip ${checkpointTipHeight}`
+    );
+  }
+
+  const { headers } = await fetchLiveHeadersU32le(nodeUrl, targetHeight - 2, checkpointTipHeight);
+  const descHeaders = headers.slice().reverse();
+  const headerChainDescU32le = encodeU32leStream(descHeaders);
+
+  const idsResp = await fetch(`${base}/blocks/at/${targetHeight}`);
+  if (!idsResp.ok) throw new Error(`Node /blocks/at/${targetHeight} HTTP ${idsResp.status}`);
+  const ids = await idsResp.json();
+  if (!Array.isArray(ids) || ids.length === 0) {
+    throw new Error(`No block ID returned at height ${targetHeight}`);
+  }
+  const blockId = ids[0];
+
+  const blkResp = await fetch(`${base}/blocks/${blockId}`);
+  if (!blkResp.ok) throw new Error(`Node /blocks/${blockId} HTTP ${blkResp.status}`);
+  const blockJson = await blkResp.json();
+  const changes = extractBlockStateChanges(blockJson);
+  if (!changes.ad_proofs_hex) {
+    throw new Error(`Node did not return adProofs.proofBytes for block ${targetHeight}`);
+  }
+
+  let txId = null;
+  if (typeof txSelector === "string" && txSelector.trim().length === 64) {
+    txId = txSelector.trim().toLowerCase();
+  } else if (changes.tx_ids.length > 0) {
+    const idx = Math.min(Math.max(0, Number(txSelector) || 0), changes.tx_ids.length - 1);
+    txId = changes.tx_ids[idx];
+  }
+
+  let merkleTxProof = null;
+  if (txId) {
+    const mpResp = await fetch(`${base}/blocks/${blockId}/proofFor/${txId}`);
+    if (!mpResp.ok) throw new Error(`Node /blocks/${blockId}/proofFor/${txId} HTTP ${mpResp.status}`);
+    merkleTxProof = await mpResp.json();
+  }
+
+  const blockProofJson = JSON.stringify({
+    ad_proofs_hex: changes.ad_proofs_hex,
+    lookup_box_ids: changes.lookup_box_ids,
+    spent_box_ids: changes.spent_box_ids,
+    created_boxes: changes.created_boxes,
+    merkle_tx_proof: merkleTxProof,
+  });
+
+  return {
+    blockId,
+    targetHeight,
+    txId,
+    txCount: changes.tx_count,
+    headerChainDescU32le,
+    blockProofJson,
+  };
+}
+
 export function encodeVlqUint(value) {
   let v = typeof value === "bigint" ? value : BigInt(value);
   if (v < 0n) throw new Error(`Negative VLQ value: ${v}`);
@@ -282,6 +446,32 @@ export class NiPoPoWV2Wasm {
     this._free(bCkpt);
     this._free(bExt);
     this._free(bFix);
+    if (rc !== 0) {
+      throw new Error(rawOut);
+    }
+    return { ...JSON.parse(rawOut), elapsedMs };
+  }
+
+  verifyCheckpointBlockState(checkpointJson, headerChainDescU32le, blockProofJson) {
+    const bCkpt = this._allocCopy(textEnc.encode(checkpointJson));
+    const bChain = this._allocCopy(headerChainDescU32le);
+    const bBlock = this._allocCopy(
+      typeof blockProofJson === "string" ? textEnc.encode(blockProofJson) : blockProofJson
+    );
+    const t0 = performance.now();
+    const rc = this.exp.wasm_verify_checkpoint_block_state(
+      bCkpt.ptr,
+      bCkpt.len,
+      bChain.ptr,
+      bChain.len,
+      bBlock.ptr,
+      bBlock.len
+    );
+    const elapsedMs = performance.now() - t0;
+    const rawOut = this._readOutput();
+    this._free(bCkpt);
+    this._free(bChain);
+    this._free(bBlock);
     if (rc !== 0) {
       throw new Error(rawOut);
     }

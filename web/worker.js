@@ -1,5 +1,5 @@
 // Dedicated Web Worker keeping Ergo NiPoPoW V2 WASM verification off the UI thread.
-import { NiPoPoWV2Wasm, fetchLiveHeadersU32le } from "./nipopow-v2.js";
+import { NiPoPoWV2Wasm, fetchLiveHeadersU32le, fetchLiveBlockProofBundle } from "./nipopow-v2.js";
 
 let wasmClient = null;
 
@@ -57,6 +57,22 @@ self.onmessage = async (ev) => {
         payload.fixtureBytes
       );
       self.postMessage({ id, ok: true, result: res });
+    } else if (type === "verifyLiveBlockFromNode") {
+      if (!wasmClient) throw new Error("WASM not initialized");
+      const { nodeUrl, checkpointJson, targetHeight, txSelector } = payload;
+      const ckpt = JSON.parse(checkpointJson);
+      const h = targetHeight > 0 ? targetHeight : ckpt.tip_height;
+      const bundle = await fetchLiveBlockProofBundle(nodeUrl, ckpt.tip_height, h, txSelector);
+      const res = wasmClient.verifyCheckpointBlockState(
+        checkpointJson,
+        bundle.headerChainDescU32le,
+        bundle.blockProofJson
+      );
+      self.postMessage({
+        id,
+        ok: true,
+        result: { ...res, tx_id: bundle.txId, tx_count: bundle.txCount },
+      });
     } else {
       throw new Error(`Unknown worker action: ${type}`);
     }

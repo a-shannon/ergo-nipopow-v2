@@ -130,6 +130,20 @@ jobs:
             console.log("WEB_SDK_CI_PASS: profile=" + verified.profile + " tip=" + verified.tip_height + " -> " + extended.tip_height);
           '
 
+          echo "=== Verify npm package (@ergo-nipopow-v2/light-wasm) parity & dry-run pack ==="
+          cmp -s web/nipopow-v2.js packages/light-wasm/index.js
+          (cd packages/light-wasm && npm pack --dry-run)
+          node --input-type=module -e '
+            import fs from "node:fs";
+            import { NiPoPoWV2Wasm } from "./packages/light-wasm/index.js";
+            const wasm = fs.readFileSync("target/wasm32-unknown-unknown/release/ergo_nipopow_v2_light.wasm");
+            const client = await NiPoPoWV2Wasm.load(wasm);
+            if (typeof client.verifyCheckpointBlockState !== "function") {
+              throw new Error("missing verifyCheckpointBlockState export");
+            }
+            console.log("NPM_LIGHT_WASM_PACKAGE_CI_PASS");
+          '
+
           echo "=== Regression test: verify_exact_tail binds strictly to certified statement tip (PR #1) ==="
           NPV2_CERT_BIN="$PWD/release-assets/ergo-mainnet-1827840-prod128-zisk-stir.npv2.bin" \
           NPV2_TAIL_U32LE="$PWD/release-assets/tail-1819645-1827840.u32le" \
