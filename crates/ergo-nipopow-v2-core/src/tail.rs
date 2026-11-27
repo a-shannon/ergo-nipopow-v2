@@ -33,6 +33,8 @@ pub enum TailError {
         total_work: u128,
         required_work: u128,
     },
+    /// The tail does not end at the tip the certified statement commits to.
+    StatementTipMismatch,
 }
 
 mod serde_arr33 {
@@ -273,6 +275,14 @@ pub fn verify_exact_tail(
         parent_id = id;
         prev_timestamp = header.timestamp;
         prev_difficulty = diff;
+    }
+
+    // The tail must end at the certified tip: same height, same header id, same total work.
+    if n != bootstrap.tip_height
+        || parent_id != bootstrap.tip_id
+        || total_work != bootstrap.total_work
+    {
+        return Err(TailError::StatementTipMismatch);
     }
 
     // Check eq. (27): exact 4-integer old-origin guard for all origins i <= b
