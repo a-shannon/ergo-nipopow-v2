@@ -207,10 +207,34 @@ Measured with `ergo-nipopow-v2-aggregator verify-cert` compiled with `--no-defau
 | **Root STARK verification (CPU-only)** | **`0.002 s` (`2 ms`)** | **`0.195 s`** (both STARKs) |
 | **128-bit PoW audit (`13,748` draws)** | **`2.142 s`** | **`2.035 s`** |
 | **Exact modern tail (`8,196` headers + PoW)** | **`1.266 s`** | **`1.229 s`** |
-| **Total cold client CPU time** | **`3.462 s`** | **`3.508 s`** |
+| **Total cold client CPU time** | **`3.462 s`** (`3.274 s` on v0.3.0) | **`3.508 s`** (`3.481 s` on v0.3.0) |
+| **Total cold sync download (gzip-9 `.gz`)** | **`5.97 MiB`** (**`1.47%`** of 407.07 MiB) | **`6.24 MiB`** (**`1.53%`** of 407.07 MiB) |
 | Isolated negative tamper checks | **PASS (fail-closed)** | **PASS on BOTH proofs (fail-closed)** |
 
-#### 7.4 Verified Mainnet Commitments, Pinned VKs & Artifact SHA-256 Digests
+#### 7.4 Standalone WASM Light Verifier, Indefinite Plain-Header Continuation, Real Mainnet AVL+ State Proofs & CPU-Only Proving (`v0.3.0`)
+
+To eliminate any prover-liveness dependency for returning light clients, connect certified headers directly to Ergo's UTXO state layer, and empirically measure GPU-free proving:
+
+1. **Zero-Prover-SDK Light Verifier & `wasm32-unknown-unknown` Target (`crates/ergo-nipopow-v2-light`):**
+   - Compiles cleanly to native CPU and **`wasm32-unknown-unknown`** with zero OpenVM SDK, zero CUDA, and zero C++ dependencies (`zisk-verifier v1.4.0-alpha`, `ergo_avltree_rust v0.1.1`, `k256`, pure-Rust `flate2`).
+   - Supports transparent pure-Rust gzip transport, reducing cold sync wire size to **`5.97 MiB`** (ZisK STIR `.gz` + tail `.gz`) or **`6.24 MiB`** (Dual `.gz` + tail `.gz`). Note: `ergo-nipopow-v2-light` verifies the ZisK STIR proof natively and reports whether an OpenVM dual proof is attached; full verification of both STARKs uses `ergo-nipopow-v2-aggregator --no-default-features`.
+2. **Zero Prover Liveness Cliff (`LightCheckpoint` + `extend-tail`):**
+   - After one cold verification, the client persists a **`5,748 B` (`5.6 KiB`)** JSON `LightCheckpoint` storing the authenticated tip, EIP-37 anchor ring, and maturity state.
+   - Returning clients extend this checkpoint indefinitely with plain Ergo headers only (`~160 KiB/day` at 720 blocks/day, zero STARK download, zero prover server).
+   - Verified end-to-end on **136 live Ergo mainnet blocks mined after `1,827,840`** (`1,827,841..=1,827,976`, `30,464 B` wire, crossing the real mainnet EIP-37 difficulty retarget `105028762 -> 105229481` at height `1,827,969`) in **`0.147 s`**, advancing the certified `state_root` to `25b40830db79b785281b2e76d9d932f97594893d420b24d7336eb7c867ef954819`. Isolated 1-bit tampers on parent link, EIP-37 `nBits` at `1,827,969`, and Autolykos v2 PoW nonce at `1,827,976` all fail closed.
+3. **End-to-End Trustless Mainnet AVL+ `ADProofs` & Transaction Merkle Verification (`verify-state-proof`):**
+   - Extracts certified headers `h - 1 = 1,823,985` and `h = 1,823,986` directly from the verified `.gz` certificate and exact tail, then replays:
+     - The real Ergo mainnet **`2,809 B` `ADProofs`** AVL+ batch state transition via `ergo_avltree_rust::BatchAVLVerifier` (`BLAKE2b-256(adProofs) == adProofsRoot`, removing the spent box `e9930f6b...0148` and inserting both canonically serialized created boxes verified via `BLAKE2b-256(raw) == boxId`), matching `header(1,823,986).state_root` (`46945bcd...9d819`) bit-for-bit from `header(1,823,985).state_root` (`88aaa010...f619`).
+     - The real Ergo mainnet 5-level Scorex Merkle membership proof (`BLAKE2b-256` with `0x00`/`0x01` domain tags) for block `1,823,985` (12 transactions) against `header(1,823,985).transactions_root`.
+   - Combined state + transaction proof verification time: **`0.09 ms`**, with **`3/3` isolated tamper checks** (mutated `ADProofs` byte, mutated created-box byte, mutated expected `state_root`, plus mutated Merkle leaf) rejected fail-closed.
+4. **Measured Permissionless CPU-Only Proving (Zero GPU, `scripts/renew_zisk_cpu.sh`):**
+   - Reusing the published `6.57 MiB` `zisk-l1-1827840-prod128-archive.tar.gz` (14 immutable L1 proofs covering `99.5%` of history), a real shifting mainnet leaf segment (`seg-00444b`, 63 headers, `expected_sha256 = 87e93842...587c`) was proved and verified on a 16-core x86_64 CPU with zero GPU via `cargo-zisk-cpu prove -m -y`: **`608.97 s` (`10 min 09 s`)** prove time (`652.65 s` wall clock including Proofman init), **`43.12 GiB` peak RSS**, `0` swaps, `Proof verified successfully`.
+   - This establishes empirically both that GPU-free permissionless renewal works on a standard 64 GiB RAM CPU host and its exact computational trade-off relative to single-GPU renewal (`~30 s`).
+5. **Reproducible Verifying Keys (`scripts/verify_reproducible_vks.sh` & Committed Guest `Cargo.lock`s):**
+   - All 6 guest `Cargo.lock` files (`guests-zisk/*` and `guests/*`) are committed in-tree.
+   - Compiling ZisK guests with `--remap-path-prefix` strips 100% of host paths and was empirically verified across two distinct directory trees to produce bit-for-bit identical ZisK ROM roots. (Note: the initial `v0.2.0` `1,827,840` proof snapshot predated `--remap-path-prefix`, so `agg-l1` reproduces its `v0.2.0` ROM root bit-for-bit across directories while `leaf-segment` and `agg-root` require the `--remap-path-prefix` build for path-independent reproduction in subsequent proving campaigns.)
+
+#### 7.5 Verified Mainnet Commitments, Pinned VKs & Artifact SHA-256 Digests
 
 - **Certified tip (`n = 1,827,840`):** `20ed709e5e9ba0d40fa941b2de53a3cdbd5bf29950b4a40adad8d244209ff9b3`
 - **Certified bootstrap (`b = 1,819,644`):** `6e97a4d1f03d81766c2c0b59cf4fadf19a961ee6fe37cfb08f7000eefb61f2e2`
@@ -236,10 +260,11 @@ Measured with `ergo-nipopow-v2-aggregator verify-cert` compiled with `--no-defau
 ### 8. Adversarial Testing & Ecosystem Adoption Roadmap
 
 #### Fail-Closed Negative Test Coverage
-1. **Core consensus negative suite (`crates/ergo-nipopow-v2-core/tests/adversarial_negatives.rs`, 6/6 PASS):** Rejects mutated genesis, broken parent link, non-increasing timestamps, altered difficulty, off-curve/wrong-parity secp256k1 witness, trailing header bytes, non-contiguous segment merges, PoW-era mismatches, tampered `pi_s` audit binding, corrupted MMR siblings, tampered Autolykos PoW nonces, cross-profile substitution, and malformed `DualStructuralProof` framing.
-2. **Live mainnet certificate tamper suite (`ergo-nipopow-v2-aggregator verify-cert`, PASS on both `DualZiskV14OpenVmV21` and `ZiskStirV14`):** Rejects isolated single-fault mutations on (1) `BootstrapStatement.total_work + 1`, (2) 1-bit flip in `structural_proof` audit binding, (3) 1-bit flip in `audit.multiproof.siblings[0]`, (4) 1-bit flip in tail header PoW nonce, (5) direct 1-bit tamper on the ZisK STIR proof and field tamper on OpenVM `user_pvs_proof`, and (6) tampered `bootstrap_eip37_anchors` (including 1 ms timestamp perturbation).
+1. **Core consensus negative suite (`crates/ergo-nipopow-v2-core/tests/adversarial_negatives.rs`, PASS):** Rejects mutated genesis, broken parent link, non-increasing timestamps, altered difficulty, off-curve/wrong-parity secp256k1 witness, trailing header bytes, non-contiguous segment merges, PoW-era mismatches, tampered `pi_s` audit binding, corrupted MMR siblings, tampered Autolykos PoW nonces, cross-profile substitution, and malformed `DualStructuralProof` framing.
+2. **Standalone light-client, state-proof & tail-extension negative suite (`crates/ergo-nipopow-v2-light`, PASS):** Rejects isolated 1-bit tampers on real mainnet `1,823,986` `ADProofs` bytes, created box bytes, expected `state_root`, `1,823,985` Scorex transaction Merkle leaf, and real post-`1,827,840` `extend-tail` headers (parent link, EIP-37 retarget `nBits` at `1,827,969`, and Autolykos v2 PoW nonce at `1,827,976`).
+3. **Live mainnet certificate tamper suite (`ergo-nipopow-v2-aggregator verify-cert`, PASS on both `DualZiskV14OpenVmV21` and `ZiskStirV14`):** Rejects isolated single-fault mutations on (1) `BootstrapStatement.total_work + 1`, (2) 1-bit flip in `structural_proof` audit binding, (3) 1-bit flip in `audit.multiproof.siblings[0]`, (4) 1-bit flip in tail header PoW nonce, (5) direct 1-bit tamper on the ZisK STIR proof and field tamper on OpenVM `user_pvs_proof`, and (6) tampered `bootstrap_eip37_anchors` (including 1 ms timestamp perturbation).
 
 #### Remaining Ecosystem Integration Gates
 Before production deployment inside end-user wallets securing mainnet funds:
-1. **Independent external security audit** of `ergo-nipopow-v2-core`, the pinned ZisK and OpenVM guest binaries, and the constant-depth (`d = 2`) extraction argument, alongside completion of ZisK `v1.4`'s ongoing external audits.
-2. **Ergo node transport & wallet integration:** Serving verified `(V2Certificate, exact_tail)` bundles via Ergo node REST/P2P endpoints and running an automated continuous renewal daemon over live mainnet blocks.
+1. **Independent external security audit** of `ergo-nipopow-v2-core`, `ergo-nipopow-v2-light`, the pinned ZisK and OpenVM guest binaries, and the constant-depth (`d = 2`) extraction argument, alongside completion of ZisK `v1.4`'s ongoing external audits.
+2. **Path-remapped proving campaign & Ergo node transport:** Producing the next mainnet snapshot under `--remap-path-prefix` (`scripts/verify_reproducible_vks.sh`) for universal path-independent ELF/VK verification across all three guest stages, and serving verified `(V2Certificate, exact_tail)` bundles via Ergo node REST/P2P endpoints.

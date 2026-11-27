@@ -18,4 +18,6 @@ pub mod pow;
 pub mod profile;
 pub mod secp256k1;
 pub mod segment;
+#[cfg(feature = "std")]
+pub mod state_proof;
 pub mod tail;

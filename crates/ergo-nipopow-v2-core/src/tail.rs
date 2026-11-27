@@ -35,15 +35,84 @@ pub enum TailError {
     },
 }
 
+mod serde_arr33 {
+    use alloc::vec::Vec;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(val: &[u8; 33], s: S) -> Result<S::Ok, S::Error> {
+        val.as_slice().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 33], D::Error> {
+        let v = Vec::<u8>::deserialize(d)?;
+        v.try_into()
+            .map_err(|_| serde::de::Error::custom("expected exactly 33 bytes"))
+    }
+}
+
+/// Certified Ergo header summary extracted from a verified exact continuation tail.
+///
+/// Exposes the authenticated roots (`state_root`, `transactions_root`, `ad_proofs_root`)
+/// needed by light clients to trustlessly verify AVL+ UTXO state proofs and transaction
+/// Merkle inclusion proofs served by untrusted peers.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CertifiedHeaderSummary {
+    pub height: u32,
+    pub id: [u8; 32],
+    pub parent_id: [u8; 32],
+    #[serde(with = "serde_arr33")]
+    pub state_root: [u8; 33],
+    pub transactions_root: [u8; 32],
+    pub ad_proofs_root: [u8; 32],
+    pub timestamp: i64,
+    pub n_bits: u32,
+}
+
+impl CertifiedHeaderSummary {
+    pub fn from_header(header: &Header, id: [u8; 32]) -> Self {
+        Self {
+            height: header.height,
+            id,
+            parent_id: header.parent_id,
+            state_root: header.state_root,
+            transactions_root: header.transactions_root,
+            ad_proofs_root: header.ad_proofs_root,
+            timestamp: header.timestamp,
+            n_bits: header.n_bits,
+        }
+    }
+}
+
+/// Compact returning-client checkpoint (~1.2 KiB) enabling indefinite tail extension
+/// using plain Ergo headers only (~160 KiB/day, zero STARK download, zero prover liveness cliff).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LightCheckpoint {
+    pub bootstrap: BootstrapStatement,
+    pub tip_height: u32,
+    pub tip_id: [u8; 32],
+    pub tip_timestamp: i64,
+    pub tip_difficulty: u128,
+    #[serde(with = "serde_arr33")]
+    pub tip_state_root: [u8; 33],
+    pub tip_transactions_root: [u8; 32],
+    pub tip_ad_proofs_root: [u8; 32],
+    pub total_work: u128,
+    pub max_tail_diff: u128,
+    pub eip37_anchors: Vec<DaaAnchor>,
+}
+
 /// Verified exact-tail continuation result.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedTail {
     pub query_height: u32,
     pub query_header_id: [u8; 32],
     pub query_raw: Vec<u8>,
+    pub query_header: Option<CertifiedHeaderSummary>,
+    pub prev_query_header: Option<CertifiedHeaderSummary>,
     pub tip_height: u32,
     pub tip_id: [u8; 32],
     pub total_work: u128,
+    pub checkpoint: LightCheckpoint,
 }
 
 fn lookup_band_difficulty(bands: &[(u32, u128)], height: u32) -> Option<u128> {
@@ -131,9 +200,14 @@ pub fn verify_exact_tail(
     let mut parent_id = bootstrap.bootstrap_id;
     let mut prev_timestamp = bootstrap.bootstrap_timestamp;
     let mut prev_difficulty = bootstrap.bootstrap_difficulty;
+    let mut tip_state_root = [0u8; 33];
+    let mut tip_transactions_root = [0u8; 32];
+    let mut tip_ad_proofs_root = [0u8; 32];
     let mut total_work = bootstrap.w_b;
     let mut tail_work_prefix = Vec::with_capacity(tail_headers.len());
     let mut query_raw = Vec::new();
+    let mut query_header: Option<CertifiedHeaderSummary> = None;
+    let mut prev_query_header: Option<CertifiedHeaderSummary> = None;
     let mut query_id = if query_height == b {
         bootstrap.bootstrap_id
     } else {
@@ -185,10 +259,17 @@ pub fn verify_exact_tail(
                 difficulty: diff,
             });
         }
+        if query_height > 0 && expected_h == query_height - 1 {
+            prev_query_header = Some(CertifiedHeaderSummary::from_header(&header, id));
+        }
         if expected_h == query_height {
             query_raw = raw.clone();
             query_id = id;
+            query_header = Some(CertifiedHeaderSummary::from_header(&header, id));
         }
+        tip_state_root = header.state_root;
+        tip_transactions_root = header.transactions_root;
+        tip_ad_proofs_root = header.ad_proofs_root;
         parent_id = id;
         prev_timestamp = header.timestamp;
         prev_difficulty = diff;
@@ -241,12 +322,138 @@ pub fn verify_exact_tail(
         });
     }
 
+    let checkpoint = LightCheckpoint {
+        bootstrap: bootstrap.clone(),
+        tip_height: n,
+        tip_id: parent_id,
+        tip_timestamp: prev_timestamp,
+        tip_difficulty: prev_difficulty,
+        tip_state_root,
+        tip_transactions_root,
+        tip_ad_proofs_root,
+        total_work,
+        max_tail_diff,
+        eip37_anchors: eip_anchors,
+    };
+
     Ok(VerifiedTail {
         query_height,
         query_header_id: query_id,
         query_raw,
+        query_header,
+        prev_query_header,
         tip_height: n,
         tip_id: parent_id,
         total_work,
+        checkpoint,
     })
+}
+
+/// Extend an already-verified `LightCheckpoint` using plain Ergo headers only
+/// (~160 KiB/day, zero STARK download, zero prover liveness dependency).
+///
+/// Validates every new header's canonical encoding, height sequence, parent linkage,
+/// strictly increasing timestamps, contextual EIP-37 DAA, and native Autolykos v2 PoW,
+/// and enforces the old-origin maturity invariant.
+#[cfg(feature = "native-pow")]
+pub fn extend_checkpoint(
+    checkpoint: &LightCheckpoint,
+    new_headers: &[Vec<u8>],
+) -> Result<(LightCheckpoint, Vec<CertifiedHeaderSummary>), TailError> {
+    if !checkpoint.bootstrap.sampled_eligible {
+        return Err(TailError::BootstrapNotEligible);
+    }
+    if checkpoint.eip37_anchors.len() != 9 {
+        return Err(TailError::InvalidContext);
+    }
+    for w in checkpoint.eip37_anchors.windows(2) {
+        if w[1].height != w[0].height + EIP37_EPOCH || w[1].timestamp <= w[0].timestamp {
+            return Err(TailError::InvalidContext);
+        }
+    }
+    let last_epoch_le_tip = checkpoint.tip_height - (checkpoint.tip_height % EIP37_EPOCH);
+    if checkpoint.eip37_anchors.last().unwrap().height != last_epoch_le_tip {
+        return Err(TailError::InvalidContext);
+    }
+
+    let mut next = checkpoint.clone();
+    let mut appended = Vec::with_capacity(new_headers.len());
+
+    for raw in new_headers {
+        let expected_h = next
+            .tip_height
+            .checked_add(1)
+            .ok_or(TailError::QueryOutOfRange)?;
+        let (header, _) = Header::decode_native(raw, None).map_err(TailError::Header)?;
+        if header.height != expected_h {
+            return Err(TailError::Header(HeaderError::HeightOutOfRange));
+        }
+        header.check_era_binding().map_err(TailError::Header)?;
+        if header.parent_id != next.tip_id {
+            return Err(TailError::ParentLinkMismatch);
+        }
+        if header.timestamp <= next.tip_timestamp {
+            return Err(TailError::TimestampNotIncreasing);
+        }
+        let diff = decode_compact(header.n_bits).map_err(TailError::Daa)?;
+        let req = required_difficulty(expected_h, next.tip_difficulty, &next.eip37_anchors)
+            .map_err(TailError::Daa)?;
+        if diff != req {
+            return Err(TailError::Daa(DaaError::DifficultyMismatch {
+                expected: req,
+                got: diff,
+            }));
+        }
+        crate::pow::verify_header_pow(&header).map_err(TailError::Pow)?;
+
+        let id = blake2b256(raw);
+        next.total_work = next
+            .total_work
+            .checked_add(diff)
+            .ok_or(TailError::WorkOverflow)?;
+        if diff > next.max_tail_diff {
+            next.max_tail_diff = diff;
+        }
+        if expected_h % EIP37_EPOCH == 0 {
+            if next.eip37_anchors.len() == 9 {
+                next.eip37_anchors.remove(0);
+            }
+            next.eip37_anchors.push(DaaAnchor {
+                height: expected_h,
+                timestamp: header.timestamp,
+                difficulty: diff,
+            });
+        }
+        next.tip_height = expected_h;
+        next.tip_id = id;
+        next.tip_timestamp = header.timestamp;
+        next.tip_difficulty = diff;
+        next.tip_state_root = header.state_root;
+        next.tip_transactions_root = header.transactions_root;
+        next.tip_ad_proofs_root = header.ad_proofs_root;
+        appended.push(CertifiedHeaderSummary::from_header(&header, id));
+    }
+
+    let params = next.bootstrap.profile.params();
+    let q_tail = if next.max_tail_diff == 0 {
+        1u128
+    } else {
+        params
+            .modern_cap(next.max_tail_diff)
+            .ok_or(TailError::CapGridOverflow)?
+    };
+    let required = next
+        .bootstrap
+        .a_b
+        .max(next.bootstrap.t1.saturating_add(params.m_exact[0].saturating_mul(q_tail)))
+        .max(next.bootstrap.t2.saturating_add(params.m_exact[1].saturating_mul(q_tail)))
+        .max(next.bootstrap.w_b.saturating_add(params.m_exact[2].saturating_mul(q_tail)));
+    if next.total_work < required {
+        return Err(TailError::MaturityGuardNotSatisfied {
+            total_work: next.total_work,
+            required_work: required,
+        });
+    }
+
+    Ok((next, appended))
 }

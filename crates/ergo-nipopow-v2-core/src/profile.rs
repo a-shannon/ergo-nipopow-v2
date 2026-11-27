@@ -7,7 +7,9 @@ use crate::daa::MAX_CAP;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ProfileId {
-    /// Legacy internal wire tag retained for cross-profile isolation tests only; use `V2Production128`.
+    /// Reserved legacy wire tag retained exclusively for cross-profile isolation tests.
+    /// Production certificates and verifiers MUST use `V2Production128` (`id = 3`).
+    /// Retained with fixed wire discriminant for deterministic serialization parity.
     V2Production = 1,
     /// Legacy wire tag retained for cross-profile isolation tests only; use `V2Production128`.
     V2LegacyR15 = 2,

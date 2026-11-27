@@ -1,0 +1,28 @@
+[package]
+name = "ergo-nipopow-v2-light"
+version = "0.3.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["A. Shannon"]
+description = "Minimal standalone zero-prover-SDK Ergo NiPoPoW V2 light-client verifier (native CPU + wasm32), returning-user tail extension, and trustless Ergo tx/AVL+ UTXO state-proof verification"
+
+[features]
+default = ["cli"]
+cli = ["dep:clap"]
+
+[dependencies]
+bincode = "1.3"
+bytes = { version = "1", default-features = false }
+clap = { version = "4.6", features = ["derive"], optional = true }
+ergo_avltree_rust = { version = "0.1.1", default-features = false }
+ergo-nipopow-v2-core = { path = "../ergo-nipopow-v2-core", features = ["std", "native-pow"] }
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+hex = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+zisk-verifier = "1.4.0-alpha"
+
+[[bin]]
+name = "ergo-nipopow-v2-light"
+path = "src/main.rs"
+required-features = ["cli"]

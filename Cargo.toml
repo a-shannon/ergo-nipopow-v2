@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/ergo-nipopow-v2-core",
     "crates/ergo-nipopow-v2-cli",
+    "crates/ergo-nipopow-v2-light",
 ]
 exclude = [
     "guests/leaf-segment",
@@ -15,7 +16,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["A. Shannon"]

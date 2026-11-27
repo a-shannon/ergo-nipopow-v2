@@ -7,24 +7,82 @@ on:
   workflow_dispatch:
 
 jobs:
-  core-tests-and-certification:
-    name: Core Consensus Tests & Exact Rational 128-Bit Certification
+  core-light-wasm-and-state-proofs:
+    name: Core Tests, WASM32 Light Verifier, Mainnet AVL+ & Tail Extension
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Run exact rational 128-bit parameter certification
         run: python3 scripts/certify_profiles.py
 
-      - name: Run core unit tests & adversarial negative suite
+      - name: Run workspace unit tests, adversarial negatives, mainnet AVL+ ADProofs & live extend-tail
         run: cargo test --release
 
+      - name: Verify standalone light verifier compiles cleanly to wasm32-unknown-unknown (zero prover SDK)
+        run: |
+          cargo build -p ergo-nipopow-v2-light --no-default-features --target wasm32-unknown-unknown --release
+          ls -lh target/wasm32-unknown-unknown/release/libergo_nipopow_v2_light.rlib
+          echo "WASM32_LIGHT_VERIFIER_BUILD_OK"
+
+      - name: Build native ergo-nipopow-v2-light CLI & verify zero CUDA dependencies
+        run: |
+          cargo build -p ergo-nipopow-v2-light --release
+          if ldd target/release/ergo-nipopow-v2-light | grep -qi cuda; then
+            echo "ERROR: CUDA dependency leaked into ergo-nipopow-v2-light" >&2
+            exit 1
+          fi
+          echo "LIGHT_CLI_ZERO_CUDA_DEPS_OK"
+
+      - name: Cold-verify compressed (.gz) mainnet certs, extend-tail past 1,827,840 & verify real AVL+ ADProofs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view v0.2.0 -R "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "INFO: Release v0.2.0 not published yet; skipping live release asset check."
+            exit 0
+          fi
+          mkdir -p release-assets work-light
+          gh release download v0.2.0 -R "${{ github.repository }}" -D release-assets \
+            -p "ergo-mainnet-1827840-prod128-dual.npv2.bin" \
+            -p "ergo-mainnet-1827840-prod128-zisk-stir.npv2.bin" \
+            -p "tail-1819645-1827840.u32le" \
+            -p "SHA256SUMS.txt"
+          (cd release-assets && sha256sum --ignore-missing -c SHA256SUMS.txt)
+
+          LIGHT=target/release/ergo-nipopow-v2-light
+
+          echo "=== Compress Dual cert, STIR cert & exact tail with pure-Rust gzip-9 ==="
+          "$LIGHT" compress --input release-assets/ergo-mainnet-1827840-prod128-dual.npv2.bin --output work-light/dual.npv2.bin.gz
+          "$LIGHT" compress --input release-assets/ergo-mainnet-1827840-prod128-zisk-stir.npv2.bin --output work-light/stir.npv2.bin.gz
+          "$LIGHT" compress --input release-assets/tail-1819645-1827840.u32le --output work-light/tail.u32le.gz
+
+          echo "=== Light cold verify (.gz STIR) + save 5.6 KiB LightCheckpoint ==="
+          "$LIGHT" verify-cert \
+            --cert-bin work-light/stir.npv2.bin.gz \
+            --headers-u32le work-light/tail.u32le.gz \
+            --save-checkpoint work-light/ckpt-1827840.json
+
+          echo "=== Extend LightCheckpoint past 1,827,840 using 136 live mainnet headers (zero STARK, crosses EIP-37 retarget) ==="
+          "$LIGHT" extend-tail \
+            --checkpoint-in work-light/ckpt-1827840.json \
+            --new-headers-u32le crates/ergo-nipopow-v2-light/testdata/extension_1827841_1827976.u32le \
+            --checkpoint-out work-light/ckpt-1827976.json
+
+          echo "=== End-to-end trustless AVL+ ADProofs (block 1,823,986) & Tx Merkle (block 1,823,985) against .gz cert ==="
+          "$LIGHT" verify-state-proof \
+            --cert-bin work-light/dual.npv2.bin.gz \
+            --headers-u32le work-light/tail.u32le.gz \
+            --state-fixture-json crates/ergo-nipopow-v2-light/testdata/mainnet_1823986_state_proof.json
+
   cold-cpu-verify-mainnet-certificates:
-    name: Cold Zero-CUDA CPU Verification of Mainnet 128-Bit Certificates
+    name: Cold Zero-CUDA CPU Verification of Mainnet 128-Bit Dual Certificates
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -35,7 +93,7 @@ jobs:
         with:
           workspaces: host-aggregator
 
-      - name: Build CPU-only (zero-CUDA) verifier
+      - name: Build CPU-only (zero-CUDA) full Dual-Proof verifier
         run: |
           cargo build --manifest-path host-aggregator/Cargo.toml --release --no-default-features
           if ldd host-aggregator/target/release/ergo-nipopow-v2-aggregator | grep -qi cuda; then
@@ -44,7 +102,7 @@ jobs:
           fi
           echo "CPU_AGG_ZERO_CUDA_DEPS_OK"
 
-      - name: Download v0.2.0 mainnet release certificates & run cold CPU verification
+      - name: Download v0.2.0 mainnet release certificates & run cold CPU Dual verification
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
