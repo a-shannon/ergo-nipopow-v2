@@ -10,6 +10,7 @@
 *.stark.proof
 *.u32le
 !crates/ergo-nipopow-v2-core/testdata/prefix-4096.u32le
+!crates/ergo-nipopow-v2-light/testdata/extension_1827841_1827976.u32le
 *.key
 __pycache__/
 *.pyc
