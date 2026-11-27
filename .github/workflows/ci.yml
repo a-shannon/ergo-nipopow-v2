@@ -25,11 +25,13 @@ jobs:
       - name: Run workspace unit tests, adversarial negatives, mainnet AVL+ ADProofs & live extend-tail
         run: cargo test --release
 
-      - name: Verify standalone light verifier compiles cleanly to wasm32-unknown-unknown (zero prover SDK)
+      - name: Build executable wasm32-unknown-unknown cdylib (zero prover SDK, zero JS imports)
         run: |
           cargo build -p ergo-nipopow-v2-light --no-default-features --target wasm32-unknown-unknown --release
-          ls -lh target/wasm32-unknown-unknown/release/libergo_nipopow_v2_light.rlib
-          echo "WASM32_LIGHT_VERIFIER_BUILD_OK"
+          ls -lh target/wasm32-unknown-unknown/release/ergo_nipopow_v2_light.wasm
+          gzip -9 -c target/wasm32-unknown-unknown/release/ergo_nipopow_v2_light.wasm > /tmp/ergo_nipopow_v2_light.wasm.gz
+          ls -lh /tmp/ergo_nipopow_v2_light.wasm.gz
+          echo "WASM32_CDYLIB_BUILD_OK"
 
       - name: Build native ergo-nipopow-v2-light CLI & verify zero CUDA dependencies
         run: |
@@ -40,16 +42,16 @@ jobs:
           fi
           echo "LIGHT_CLI_ZERO_CUDA_DEPS_OK"
 
-      - name: Cold-verify compressed (.gz) mainnet certs, extend-tail past 1,827,840 & verify real AVL+ ADProofs
+      - name: Cold-verify v0.4.0 certs (native + live V8 WASM), live block 1,827,976 ADProofs & multi-peer fork selection
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if ! gh release view v0.2.0 -R "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "INFO: Release v0.2.0 not published yet; skipping live release asset check."
+          if ! gh release view v0.4.0 -R "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "INFO: Release v0.4.0 not published yet; skipping live v0.4.0 release asset check."
             exit 0
           fi
           mkdir -p release-assets work-light
-          gh release download v0.2.0 -R "${{ github.repository }}" -D release-assets \
+          gh release download v0.4.0 -R "${{ github.repository }}" -D release-assets \
             -p "ergo-mainnet-1827840-prod128-dual.npv2.bin" \
             -p "ergo-mainnet-1827840-prod128-zisk-stir.npv2.bin" \
             -p "tail-1819645-1827840.u32le" \
@@ -75,11 +77,38 @@ jobs:
             --new-headers-u32le crates/ergo-nipopow-v2-light/testdata/extension_1827841_1827976.u32le \
             --checkpoint-out work-light/ckpt-1827976.json
 
-          echo "=== End-to-end trustless AVL+ ADProofs (block 1,823,986) & Tx Merkle (block 1,823,985) against .gz cert ==="
+          echo "=== Trustless AVL+ ADProofs (block 1,823,986) & Tx Merkle (block 1,823,985) against .gz Dual cert ==="
           "$LIGHT" verify-state-proof \
             --cert-bin work-light/dual.npv2.bin.gz \
             --headers-u32le work-light/tail.u32le.gz \
             --state-fixture-json crates/ergo-nipopow-v2-light/testdata/mainnet_1823986_state_proof.json
+
+          echo "=== Live post-STARK, post-EIP37-retarget block 1,827,976 AVL+ ADProofs & Tx Merkle (zero STARK) ==="
+          "$LIGHT" verify-live-state-proof \
+            --checkpoint-in work-light/ckpt-1827840.json \
+            --new-headers-u32le crates/ergo-nipopow-v2-light/testdata/extension_1827841_1827976.u32le \
+            --state-fixture-json crates/ergo-nipopow-v2-light/testdata/mainnet_1827976_live_state_proof.json
+
+          echo "=== Untrusted multi-peer fork selection (1-bit tampered peer rejected fail-closed) ==="
+          python3 -c '
+          b = bytearray(open("release-assets/ergo-mainnet-1827840-prod128-zisk-stir.npv2.bin", "rb").read())
+          b[-1] ^= 0x01
+          open("work-light/malicious.npv2.bin", "wb").write(b)
+          '
+          "$LIGHT" compare-certs \
+            --peer "malicious-peer=work-light/malicious.npv2.bin,work-light/tail.u32le.gz" \
+            --peer "honest-mirror-a=work-light/stir.npv2.bin.gz,work-light/tail.u32le.gz" \
+            --peer "honest-mirror-b=work-light/dual.npv2.bin.gz,work-light/tail.u32le.gz" \
+            --query-height 1823986
+
+          echo "=== Execute compiled .wasm binary LIVE inside V8 (Node.js) ==="
+          node --version
+          node wasm/verify_v8.mjs \
+            target/wasm32-unknown-unknown/release/ergo_nipopow_v2_light.wasm \
+            work-light/stir.npv2.bin.gz \
+            work-light/tail.u32le.gz \
+            crates/ergo-nipopow-v2-light/testdata/extension_1827841_1827976.u32le \
+            crates/ergo-nipopow-v2-light/testdata/mainnet_1827976_live_state_proof.json
 
           echo "=== Regression test: verify_exact_tail binds strictly to certified statement tip (PR #1) ==="
           NPV2_CERT_BIN="$PWD/release-assets/ergo-mainnet-1827840-prod128-zisk-stir.npv2.bin" \
@@ -107,16 +136,16 @@ jobs:
           fi
           echo "CPU_AGG_ZERO_CUDA_DEPS_OK"
 
-      - name: Download v0.2.0 mainnet release certificates & run cold CPU Dual verification
+      - name: Download v0.4.0 mainnet release certificates & run cold CPU Dual verification
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if ! gh release view v0.2.0 -R "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "INFO: Release v0.2.0 not published yet; skipping live release asset cold-verify."
+          if ! gh release view v0.4.0 -R "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "INFO: Release v0.4.0 not published yet; skipping live v0.4.0 release asset cold-verify."
             exit 0
           fi
           mkdir -p release-assets
-          gh release download v0.2.0 -R "${{ github.repository }}" -D release-assets \
+          gh release download v0.4.0 -R "${{ github.repository }}" -D release-assets \
             -p "ergo-mainnet-1827840-prod128-dual.npv2.bin" \
             -p "ergo-mainnet-1827840-prod128-zisk-stir.npv2.bin" \
             -p "tail-1819645-1827840.u32le" \
@@ -126,7 +155,7 @@ jobs:
           (cd release-assets && sha256sum --ignore-missing -c SHA256SUMS.txt)
 
           AGG=host-aggregator/target/release/ergo-nipopow-v2-aggregator
-          ZISK_VK="2061927828237341284,1907988207398174607,15624447174404746195,12050011039068599532"
+          ZISK_VK="11772000642296811191,2917608110684279903,7269122849900466967,12697094355253129467"
 
           echo "=== Cold CPU verify: Heterogeneous Dual-Proof 128-bit certificate ==="
           "$AGG" verify-cert \

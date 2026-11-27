@@ -1,11 +1,10 @@
 //! Compile-time pinned child leaf program VK (ROM root of `ergo-nipopow-v2-zisk-leaf`).
-//! Pinned from `cargo-zisk setup` on the release RV64IMA ELF
-//! (Hash ID: 356c591724cd06ff688944356da3d4beb6e5f2ab4812cf1076c46fc85f309230).
+//! Deterministic `--remap-path-prefix` build (Hash ID: 72a928ea28a2af5d6e4d0d3a690e328760df7ae5cec677aa3e3af1cbb833cbfd).
 
 pub const EXPECTED_LEAF_PROGRAM_VK: [u64; 4] = [
-    9110326089375293727,
-    2656454419186733083,
-    1581716303455200999,
-    11820023294815474883,
+    6729894743773666772,
+    11352437898911962852,
+    7890323190423858886,
+    1129626941119155303,
 ];
 pub const EXPECT_COMPRESSED_LEAF: bool = false;

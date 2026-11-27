@@ -15,10 +15,12 @@ use ergo_avltree_rust::batch_node::AVLTree;
 use ergo_avltree_rust::operation::{KeyValue, Operation};
 use ergo_nipopow_v2_core::audit::verify_audit_bundle;
 use ergo_nipopow_v2_core::certificate::{
-    DualStructuralProof, StructuralBackend, V2Certificate, CERT_MAGIC,
+    select_best, AdmittedCandidate, DualStructuralProof, StructuralBackend, V2Certificate,
+    CERT_MAGIC,
 };
 use ergo_nipopow_v2_core::header::blake2b256;
 use ergo_nipopow_v2_core::mmr::sha256_bytes;
+use ergo_nipopow_v2_core::profile::ProfileId;
 use ergo_nipopow_v2_core::state_proof::ErgoTxMerkleProof;
 use ergo_nipopow_v2_core::tail::{
     extend_checkpoint, verify_exact_tail, CertifiedHeaderSummary, LightCheckpoint, VerifiedTail,
@@ -26,12 +28,15 @@ use ergo_nipopow_v2_core::tail::{
 use flate2::read::GzDecoder;
 use zisk_verifier::keys::{VADCOP_FINAL_COMPRESSED_VK_BLAKE3, VADCOP_FINAL_VK_BLAKE3};
 
-/// Official pinned ZisK v1.4.0-alpha `agg-root` ROM root for `V2Production128`.
+#[cfg(target_arch = "wasm32")]
+pub mod wasm;
+
+/// Official pinned ZisK v1.4.0-alpha `agg-root` ROM root for `V2Production128` (`--remap-path-prefix` deterministic build).
 pub const PINNED_ZISK_ROOT_VK_PROD128: [u64; 4] = [
-    2061927828237341284,
-    1907988207398174607,
-    15624447174404746195,
-    12050011039068599532,
+    11772000642296811191,
+    2917608110684279903,
+    7269122849900466967,
+    12697094355253129467,
 ];
 
 #[derive(Debug)]
@@ -344,6 +349,74 @@ pub fn verify_tx_inclusion(
         .map_err(|e| LightError::StateProof(format!("{e:?}")))
 }
 
+/// Outcome of comparing multiple untrusted peer certificates for the same query height.
+#[derive(Clone, Debug)]
+pub struct PeerComparisonResult {
+    pub winner_index: usize,
+    pub winner_label: String,
+    pub winner_work: u128,
+    pub winner_header_id: [u8; 32],
+    pub admitted_count: usize,
+    pub rejected_peers: Vec<(String, String)>,
+}
+
+/// Independently verify multiple untrusted peer `(label, cert_bytes, tail_bytes)` bundles,
+/// drop invalid/tampered peers fail-closed, and deterministically pick the heaviest valid
+/// `V2Production128` chain via `select_best` (tie-breaking by smallest canonical bytes).
+pub fn compare_peer_certificates(
+    candidates: &[(&str, &[u8], &[u8])],
+    query_height: u32,
+    expected_zisk_root_vk: &[u64; 4],
+) -> Result<PeerComparisonResult, LightError> {
+    let mut verified_items: Vec<(usize, String, VerifiedLightCertificate, Vec<u8>)> = Vec::new();
+    let mut rejected_peers: Vec<(String, String)> = Vec::new();
+
+    for (idx, (label, cert_bytes, tail_bytes)) in candidates.iter().enumerate() {
+        match verify_light_certificate(cert_bytes, tail_bytes, query_height, expected_zisk_root_vk)
+        {
+            Ok(v) => {
+                let raw = decompress_if_gzip(cert_bytes)?;
+                verified_items.push((idx, (*label).to_string(), v, raw));
+            }
+            Err(e) => {
+                rejected_peers.push(((*label).to_string(), e.to_string()));
+            }
+        }
+    }
+
+    let admitted: Vec<AdmittedCandidate<'_>> = verified_items
+        .iter()
+        .map(|(_, _, v, raw)| AdmittedCandidate {
+            profile: v.tail.checkpoint.bootstrap.profile,
+            query_height: v.tail.query_height,
+            certified_work: v.tail.total_work,
+            header_id: v.tail.query_header_id,
+            canonical_bytes: raw.as_slice(),
+        })
+        .collect();
+
+    let best = select_best(ProfileId::V2Production128, query_height, &admitted)
+        .ok_or_else(|| LightError::Decode("no valid candidate admitted".into()))?;
+    let pos = admitted
+        .iter()
+        .position(|c| {
+            c.certified_work == best.certified_work
+                && c.header_id == best.header_id
+                && c.canonical_bytes == best.canonical_bytes
+        })
+        .expect("selected candidate present");
+    let (winner_index, winner_label, winner_v, _) = &verified_items[pos];
+
+    Ok(PeerComparisonResult {
+        winner_index: *winner_index,
+        winner_label: winner_label.clone(),
+        winner_work: winner_v.tail.total_work,
+        winner_header_id: winner_v.tail.query_header_id,
+        admitted_count: admitted.len(),
+        rejected_peers,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,5 +583,111 @@ mod tests {
             bad_daa.extend_from_slice(h);
         }
         assert!(extend_light_checkpoint_bytes(&ckpt, &bad_daa).is_err());
+    }
+
+    #[derive(serde::Deserialize)]
+    struct LiveStateFixture {
+        height: u32,
+        prev_height: u32,
+        ad_proofs_hex: String,
+        spent_box_ids: Vec<String>,
+        created_boxes: Vec<RawCreatedBox>,
+        merkle_tx_proof: RawMerkleProof,
+    }
+
+    #[test]
+    fn real_mainnet_live_1827976_post_stark_adproofs_and_tx_merkle_with_negatives() {
+        let ckpt: LightCheckpoint =
+            serde_json::from_str(include_str!("../testdata/checkpoint_1827840.json")).unwrap();
+        let ext_bytes: &[u8] = include_bytes!("../testdata/extension_1827841_1827976.u32le");
+        let fix: LiveStateFixture = serde_json::from_str(include_str!(
+            "../testdata/mainnet_1827976_live_state_proof.json"
+        ))
+        .unwrap();
+
+        // 1. Advance 1,827,840 -> 1,827,976 using plain headers only (crossing real EIP-37 retarget at 1,827,969)
+        let (next_ckpt, hdrs) = extend_light_checkpoint_bytes(&ckpt, ext_bytes).unwrap();
+        assert_eq!(next_ckpt.tip_height, 1_827_976);
+        let prev_hdr = hdrs.iter().find(|h| h.height == fix.prev_height).unwrap();
+        let curr_hdr = hdrs.iter().find(|h| h.height == fix.height).unwrap();
+
+        // 2. Replay real mainnet block 1,827,976 ADProofs (2,828 B) bit-for-bit on the live post-STARK tip!
+        let ad_bytes = hex::decode(&fix.ad_proofs_hex).unwrap();
+        let spent: Vec<[u8; 32]> = fix.spent_box_ids.iter().map(|s| hex32(s)).collect();
+        let created: Vec<([u8; 32], Vec<u8>)> = fix
+            .created_boxes
+            .iter()
+            .map(|b| (hex32(&b.box_id), hex::decode(&b.raw_bytes_hex).unwrap()))
+            .collect();
+        let new_root =
+            verify_block_ad_proofs(prev_hdr, curr_hdr, &ad_bytes, &spent, &created).unwrap();
+        assert_eq!(new_root, curr_hdr.state_root);
+        assert_eq!(new_root, next_ckpt.tip_state_root);
+
+        // 3. Verify real mainnet block 1,827,976 Scorex tx Merkle inclusion proof against live tip header
+        let tx_proof = ErgoTxMerkleProof {
+            leaf_data: hex32(&fix.merkle_tx_proof.leaf_data),
+            levels: fix
+                .merkle_tx_proof
+                .levels
+                .iter()
+                .map(|(h, s)| (hex32(h), *s))
+                .collect(),
+        };
+        verify_tx_inclusion(curr_hdr, &tx_proof).unwrap();
+
+        // Negatives: 1-bit tampers on ADProofs, created box, and tx Merkle leaf all fail closed
+        let mut bad_ad = ad_bytes.clone();
+        bad_ad[42] ^= 0x01;
+        assert!(verify_block_ad_proofs(prev_hdr, curr_hdr, &bad_ad, &spent, &created).is_err());
+
+        let mut bad_created = created.clone();
+        bad_created[0].1[10] ^= 0x01;
+        assert!(
+            verify_block_ad_proofs(prev_hdr, curr_hdr, &ad_bytes, &spent, &bad_created).is_err()
+        );
+
+        let mut bad_tx = tx_proof.clone();
+        bad_tx.leaf_data[0] ^= 0x01;
+        assert!(verify_tx_inclusion(curr_hdr, &bad_tx).is_err());
+    }
+
+    #[test]
+    fn multi_peer_fork_selection_prefers_heaviest_valid_and_breaks_ties() {
+        let a_bytes = b"candidate-b";
+        let b_bytes = b"candidate-a";
+        let cands = [
+            AdmittedCandidate {
+                profile: ProfileId::V2Production128,
+                query_height: 1_823_986,
+                certified_work: 100,
+                header_id: [0x11; 32],
+                canonical_bytes: a_bytes,
+            },
+            AdmittedCandidate {
+                profile: ProfileId::V2Production128,
+                query_height: 1_823_986,
+                certified_work: 250,
+                header_id: [0x22; 32],
+                canonical_bytes: a_bytes,
+            },
+            AdmittedCandidate {
+                profile: ProfileId::V2Production128,
+                query_height: 1_823_986,
+                certified_work: 250,
+                header_id: [0x33; 32],
+                canonical_bytes: b_bytes,
+            },
+            AdmittedCandidate {
+                profile: ProfileId::V2Production, // wrong profile -> ignored!
+                query_height: 1_823_986,
+                certified_work: 999_999,
+                header_id: [0xff; 32],
+                canonical_bytes: b_bytes,
+            },
+        ];
+        let winner = select_best(ProfileId::V2Production128, 1_823_986, &cands).unwrap();
+        assert_eq!(winner.certified_work, 250);
+        assert_eq!(winner.header_id, [0x33; 32]); // equal work -> lexicographically smaller canonical_bytes ("candidate-a" < "candidate-b")
     }
 }

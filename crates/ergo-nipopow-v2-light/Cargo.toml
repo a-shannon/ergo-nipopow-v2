@@ -1,10 +1,13 @@
 [package]
 name = "ergo-nipopow-v2-light"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["A. Shannon"]
-description = "Minimal standalone zero-prover-SDK Ergo NiPoPoW V2 light-client verifier (native CPU + wasm32), returning-user tail extension, and trustless Ergo tx/AVL+ UTXO state-proof verification"
+description = "Minimal standalone zero-prover-SDK Ergo NiPoPoW V2 light-client verifier (native CPU + executable wasm32), multi-peer fork selection, returning-user tail extension, and trustless Ergo tx/AVL+ UTXO state-proof verification"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
 
 [features]
 default = ["cli"]

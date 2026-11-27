@@ -278,13 +278,34 @@ fn format_bytes_const(bytes: &[u8; 32]) -> String {
 }
 
 /// Compile a RISC-V guest package cleanly using `.status()` (avoids OpenVM's `/dev/tty` +
-/// piped-stderr deadlock in non-interactive or multi-SDK processes) and decode the ELF.
+/// piped-stderr deadlock in non-interactive or multi-SDK processes) with deterministic
+/// `--remap-path-prefix` flags so compiled ELFs and `exe_commit`s reproduce across hosts.
 fn build_guest_elf_clean(vm_config: &SdkVmConfig, pkg_dir: &Path, bin_name: &str) -> Result<Elf> {
     vm_config.write_to_init_file(pkg_dir, None)?;
     let target_dir = pkg_dir.join("target");
     fs::create_dir_all(&target_dir)?;
     let manifest_path = pkg_dir.join("Cargo.toml");
-    let mut cmd = openvm_build::cargo_command("build", &[]);
+    let canonical_pkg = fs::canonicalize(pkg_dir).unwrap_or_else(|_| pkg_dir.to_path_buf());
+    let repo_root = canonical_pkg
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap_or(&canonical_pkg);
+    let mut owned_flags = vec![format!(
+        "--remap-path-prefix={}=/ergo-nipopow-v2",
+        repo_root.display()
+    )];
+    if let Ok(cargo_home) = std::env::var("CARGO_HOME")
+        .or_else(|_| std::env::var("HOME").map(|h| format!("{h}/.cargo")))
+    {
+        owned_flags.push(format!("--remap-path-prefix={cargo_home}=/cargo"));
+    }
+    if let Ok(rustup_home) = std::env::var("RUSTUP_HOME")
+        .or_else(|_| std::env::var("HOME").map(|h| format!("{h}/.rustup")))
+    {
+        owned_flags.push(format!("--remap-path-prefix={rustup_home}=/rustup"));
+    }
+    let flag_refs: Vec<&str> = owned_flags.iter().map(String::as_str).collect();
+    let mut cmd = openvm_build::cargo_command("build", &flag_refs);
     let status = cmd
         .args([
             "--manifest-path",

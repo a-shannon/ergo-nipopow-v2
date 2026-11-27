@@ -16,7 +16,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["A. Shannon"]
@@ -26,6 +26,7 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 overflow-checks = true
+strip = "symbols"
 
 [profile.test]
 opt-level = 2

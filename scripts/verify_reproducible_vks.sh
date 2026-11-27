@@ -6,14 +6,13 @@
 # from the committed Rust sources and pinned Cargo.lock files in `guests-zisk/`
 # using deterministic `--remap-path-prefix` flags, verifies that ZERO build-host
 # paths remain in the ELF binaries, and checks that `cargo-zisk setup` reproduces
-# the EXACT canonical path-independent ROM roots on any x86_64 Linux machine.
+# the EXACT canonical path-independent ROM roots pinned in the live v0.4.0
+# mainnet Dual-Proof snapshot on any x86_64 Linux machine.
 #
-# Note on v0.2.0 vs v0.3.0 VKs:
-#   The initial v0.2.0 mainnet snapshot (n = 1,827,840) was built before
-#   `--remap-path-prefix` was enabled (so `agg-l1` reproduces its v0.2.0 ROM root
-#   across directories with Cargo.lock pinned, while `leaf-segment` and `agg-root`
-#   retained build-host panic paths in `.rodata`). Starting in v0.3.0, this script
-#   enforces path-independent deterministic builds for all future proving campaigns.
+# If `cargo-openvm` (OpenVM v2.1.0) is also installed on PATH, this script
+# additionally rebuilds `guests/leaf-segment` with `--remap-path-prefix`,
+# checks zero host-path leakage, and verifies bit-for-bit `.vmexe` SHA-256
+# parity with the live v0.4.0 OpenVM recursive leaf executable.
 #
 # No GPU required.
 #
@@ -26,12 +25,16 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export PATH="$HOME/.zisk/bin:$HOME/.cargo/bin:$PATH"
 CARGO_HOME_EFF="${CARGO_HOME:-$HOME/.cargo}"
+RUSTUP_HOME_EFF="${RUSTUP_HOME:-$HOME/.rustup}"
 PK="${ZISK_PROVING_KEY:-$HOME/.zisk/provingKey}"
 
-# Canonical path-independent ZisK v1.4.0-alpha ROM roots (--remap-path-prefix)
+# Canonical path-independent ZisK v1.4.0-alpha ROM roots pinned in v0.4.0 (--remap-path-prefix)
 CANONICAL_LEAF_VK="6729894743773666772,11352437898911962852,7890323190423858886,1129626941119155303"
-CANONICAL_L1_VK="5235618063795392434,4171709797758932508,5383424065217591923,5276006706482555221"
-CANONICAL_ROOT_VK="14775302394889233081,9096538287251514228,8017293709441266280,9065878602930789588"
+CANONICAL_L1_VK="13152692753993774254,9128719786947234642,6922258063440026975,14663576450590590947"
+CANONICAL_ROOT_VK="11772000642296811191,2917608110684279903,7269122849900466967,12697094355253129467"
+
+# Canonical path-independent OpenVM v2.1.0 leaf .vmexe SHA-256 pinned in v0.4.0
+CANONICAL_OPENVM_LEAF_VMEXE_SHA256="e9a785b199d26dbc99fa949291474aaea4cffe72b34592714e7ce26418f3de8e"
 
 ZISK_BIN=""
 if command -v cargo-zisk-cpu >/dev/null 2>&1; then
@@ -49,7 +52,7 @@ if [ ! -f "$PK/pilout.globalInfo.json" ]; then
   exit 1
 fi
 
-echo "=== [1/4] Verify pinned Cargo.lock files & v0.2.0 source constant consistency ==="
+echo "=== [1/4] Verify pinned Cargo.lock files, v0.4.0 source pins & stage canonical build path ==="
 for lock in \
   "$REPO_ROOT/guests-zisk/leaf-segment/Cargo.lock" \
   "$REPO_ROOT/guests-zisk/agg-l1/Cargo.lock" \
@@ -62,10 +65,22 @@ for lock in \
     exit 1
   fi
 done
-grep -Fq "9110326089375293727" "$REPO_ROOT/guests-zisk/agg-l1/src/pinned_leaf.rs"
-grep -Fq "5319951898812481023" "$REPO_ROOT/guests-zisk/agg-root/src/pinned_l1.rs"
-grep -Fq "2061927828237341284" "$REPO_ROOT/crates/ergo-nipopow-v2-light/src/lib.rs"
+grep -Fq "6729894743773666772" "$REPO_ROOT/guests-zisk/agg-l1/src/pinned_leaf.rs"
+grep -Fq "13152692753993774254" "$REPO_ROOT/guests-zisk/agg-root/src/pinned_l1.rs"
+grep -Fq "11772000642296811191" "$REPO_ROOT/crates/ergo-nipopow-v2-light/src/lib.rs"
 echo "SOURCE_LOCKFILES_AND_PINS_OK"
+
+# Stage into a fixed canonical path so Cargo path-dependency `-C metadata` hashes
+# (which influence LLVM LTO symbol layout) are 100% identical across any clone path,
+# while `--remap-path-prefix` strips 100% of host paths from the resulting binaries.
+STAGE_DIR="/tmp/ergo-nipopow-v2-repro"
+rm -rf "$STAGE_DIR"
+trap 'rm -rf "$STAGE_DIR"' EXIT
+mkdir -p "$STAGE_DIR/crates" "$STAGE_DIR/guests-zisk" "$STAGE_DIR/guests"
+cp -a "$REPO_ROOT/crates/ergo-nipopow-v2-core" "$STAGE_DIR/crates/"
+cp -a "$REPO_ROOT/guests-zisk/leaf-segment" "$REPO_ROOT/guests-zisk/agg-l1" "$REPO_ROOT/guests-zisk/agg-root" "$STAGE_DIR/guests-zisk/"
+cp -a "$REPO_ROOT/guests/leaf-segment" "$REPO_ROOT/guests/agg-l1" "$REPO_ROOT/guests/agg-root" "$STAGE_DIR/guests/"
+rm -rf "$STAGE_DIR/guests-zisk"/*/target "$STAGE_DIR/guests"/*/target
 
 build_and_check_guest() {
   local name="$1"
@@ -73,27 +88,45 @@ build_and_check_guest() {
   local bin_name="$3"
   local expected_vk="$4"
 
-  echo "=== Building $name from $dir (with --remap-path-prefix) ==="
+  echo "=== Building $name from $STAGE_DIR/$dir (with --remap-path-prefix) ==="
   (
-    cd "$REPO_ROOT/$dir"
-    RUSTFLAGS="--remap-path-prefix=$REPO_ROOT=/ergo-nipopow-v2 --remap-path-prefix=$CARGO_HOME_EFF=/cargo" \
+    cd "$STAGE_DIR/$dir"
+    RUSTFLAGS="--remap-path-prefix=$STAGE_DIR=/ergo-nipopow-v2 --remap-path-prefix=$CARGO_HOME_EFF=/cargo --remap-path-prefix=$RUSTUP_HOME_EFF=/rustup" \
       "$ZISK_BIN" build --release
   )
-  local elf="$REPO_ROOT/$dir/target/elf/riscv64ima-zisk-zkvm-elf/release/$bin_name"
+  local elf="$STAGE_DIR/$dir/target/elf/riscv64ima-zisk-zkvm-elf/release/$bin_name"
   if [ ! -f "$elf" ]; then
     echo "ERROR: expected built ELF not found at $elf" >&2
     exit 1
   fi
-  if strings "$elf" | grep -Fq "$REPO_ROOT"; then
+  if strings "$elf" | grep -F "$STAGE_DIR" >/dev/null 2>&1 || strings "$elf" | grep -F "$CARGO_HOME_EFF" >/dev/null 2>&1; then
     echo "ERROR: build-host path leaked into $elf" >&2
     exit 1
   fi
   local sha
   sha=$(sha256sum "$elf" | awk '{print $1}')
   local out
-  out="$("$ZISK_BIN" setup -e "$elf" -k "$PK" 2>&1)"
-  local got_vk
-  got_vk=$(echo "$out" | grep "Root hash:" | sed -E 's/.*\[([0-9]+), ([0-9]+), ([0-9]+), ([0-9]+)\].*/\1,\2,\3,\4/')
+  if ! out="$("$ZISK_BIN" setup -e "$elf" -k "$PK" 2>&1)"; then
+    echo "ERROR: $ZISK_BIN setup failed for $name:" >&2
+    echo "$out" >&2
+    exit 1
+  fi
+  local got_vk=""
+  if printf '%s\n' "$out" | grep -q "Root hash:"; then
+    got_vk=$(printf '%s\n' "$out" | grep "Root hash:" | sed -E 's/.*\[([0-9]+), ([0-9]+), ([0-9]+), ([0-9]+)\].*/\1,\2,\3,\4/')
+  else
+    local hash_id
+    hash_id=$(printf '%s\n' "$out" | grep "Hash ID:" | awk '{print $NF}')
+    got_vk=$(python3 - "$HOME/.zisk/cache" "$hash_id" <<'PY'
+import glob, os, struct, sys
+matches = sorted(glob.glob(os.path.join(sys.argv[1], f"{sys.argv[2]}_*.verkey.bin")))
+if not matches:
+    sys.exit(1)
+vals = struct.unpack("<4Q", open(matches[0], "rb").read()[:32])
+print(",".join(str(v) for v in vals))
+PY
+)
+  fi
   echo "  ELF SHA-256 : $sha"
   echo "  Computed VK : [$got_vk]"
   echo "  Expected VK : [$expected_vk]"
@@ -114,3 +147,26 @@ echo "=== [4/4] Rebuild & verify ZisK Root aggregator guest ==="
 build_and_check_guest "agg-root" "guests-zisk/agg-root" "ergo-nipopow-v2-zisk-agg-root" "$CANONICAL_ROOT_VK"
 
 echo "=== ALL_3_CANONICAL_PATH_INDEPENDENT_ZISK_VKS_REPRODUCED_BIT_FOR_BIT ==="
+
+if command -v cargo-openvm >/dev/null 2>&1; then
+  echo "=== [Bonus] Rebuild & verify OpenVM v2.1.0 leaf guest (--remap-path-prefix) ==="
+  (
+    cd "$STAGE_DIR/guests/leaf-segment"
+    RUSTFLAGS="--remap-path-prefix=$STAGE_DIR=/ergo-nipopow-v2 --remap-path-prefix=$CARGO_HOME_EFF=/cargo --remap-path-prefix=$RUSTUP_HOME_EFF=/rustup" \
+      cargo-openvm openvm build
+  )
+  OVM_ELF="$STAGE_DIR/guests/leaf-segment/target/riscv32im-risc0-zkvm-elf/release/ergo-nipopow-v2-guest-leaf"
+  OVM_VMEXE="$STAGE_DIR/guests/leaf-segment/openvm/release/ergo-nipopow-v2-guest-leaf.vmexe"
+  if strings "$OVM_ELF" | grep -F "$STAGE_DIR" >/dev/null 2>&1 || strings "$OVM_ELF" | grep -F "$CARGO_HOME_EFF" >/dev/null 2>&1; then
+    echo "ERROR: build-host path leaked into $OVM_ELF" >&2
+    exit 1
+  fi
+  OVM_SHA=$(sha256sum "$OVM_VMEXE" | awk '{print $1}')
+  echo "  OpenVM leaf .vmexe SHA-256 : $OVM_SHA"
+  echo "  Expected .vmexe SHA-256    : $CANONICAL_OPENVM_LEAF_VMEXE_SHA256"
+  if [ "$OVM_SHA" != "$CANONICAL_OPENVM_LEAF_VMEXE_SHA256" ]; then
+    echo "ERROR: OpenVM remapped leaf .vmexe SHA-256 mismatch!" >&2
+    exit 1
+  fi
+  echo "=== OPENVM_PATH_INDEPENDENT_LEAF_VMEXE_REPRODUCED_BIT_FOR_BIT ==="
+fi
