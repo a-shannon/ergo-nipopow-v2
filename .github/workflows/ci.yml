@@ -82,8 +82,8 @@ jobs:
             --state-fixture-json crates/ergo-nipopow-v2-light/testdata/mainnet_1823986_state_proof.json
 
           echo "=== Regression test: verify_exact_tail binds strictly to certified statement tip (PR #1) ==="
-          NPV2_CERT_BIN=release-assets/ergo-mainnet-1827840-prod128-zisk-stir.npv2.bin \
-          NPV2_TAIL_U32LE=release-assets/tail-1819645-1827840.u32le \
+          NPV2_CERT_BIN="$PWD/release-assets/ergo-mainnet-1827840-prod128-zisk-stir.npv2.bin" \
+          NPV2_TAIL_U32LE="$PWD/release-assets/tail-1819645-1827840.u32le" \
             cargo test --release -p ergo-nipopow-v2-core --test tail_binds_statement -- --ignored --nocapture
 
   cold-cpu-verify-mainnet-certificates:
