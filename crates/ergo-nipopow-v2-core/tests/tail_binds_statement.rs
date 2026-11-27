@@ -13,7 +13,7 @@
 //! genuine one; no second chain is constructed.
 
 use ergo_nipopow_v2_core::certificate::{V2Certificate, CERT_MAGIC};
-use ergo_nipopow_v2_core::tail::verify_exact_tail;
+use ergo_nipopow_v2_core::tail::{verify_exact_tail, TailError};
 
 const QUERY_HEIGHT: u32 = 1_823_986;
 
@@ -55,15 +55,15 @@ fn exact_tail_must_end_at_the_statement_tip() {
     assert_eq!(good.tip_id, stmt.tip_id);
     assert_eq!(good.total_work, stmt.total_work);
 
-    let mut accepted: Vec<&str> = Vec::new();
+    let mut wrong: Vec<&str> = Vec::new();
 
     // A statement committing to a different tip id must not accept this tail.
     let mut wrong_id = stmt.clone();
     wrong_id.tip_id[0] ^= 0x01;
     let r = verify_exact_tail(&wrong_id, &tail, QUERY_HEIGHT);
     println!("statement.tip_id changed       -> {}", outcome(&r));
-    if r.is_ok() {
-        accepted.push("tail accepted under a statement with a different tip_id");
+    if r != Err(TailError::StatementTipMismatch) {
+        wrong.push("statement with a different tip_id: expected StatementTipMismatch");
     }
 
     // A statement committing to a different total work must not accept this tail.
@@ -71,8 +71,8 @@ fn exact_tail_must_end_at_the_statement_tip() {
     wrong_work.total_work += 1;
     let r = verify_exact_tail(&wrong_work, &tail, QUERY_HEIGHT);
     println!("statement.total_work changed   -> {}", outcome(&r));
-    if r.is_ok() {
-        accepted.push("tail accepted under a statement with a different total_work");
+    if r != Err(TailError::StatementTipMismatch) {
+        wrong.push("statement with a different total_work: expected StatementTipMismatch");
     }
 
     // A statement committing to a different tip height must not accept this tail.
@@ -80,8 +80,8 @@ fn exact_tail_must_end_at_the_statement_tip() {
     wrong_height.tip_height += 1;
     let r = verify_exact_tail(&wrong_height, &tail, QUERY_HEIGHT);
     println!("statement.tip_height changed   -> {}", outcome(&r));
-    if r.is_ok() {
-        accepted.push("tail accepted under a statement with a different tip_height");
+    if r != Err(TailError::StatementTipMismatch) {
+        wrong.push("statement with a different tip_height: expected StatementTipMismatch");
     }
 
     // A tail that stops one header short of the statement's tip must not be accepted. At
@@ -89,11 +89,11 @@ fn exact_tail_must_end_at_the_statement_tip() {
     // the guard has room.
     let r = verify_exact_tail(&stmt, &tail[..tail.len() - 1], stmt.bootstrap_height);
     println!("tail one header short          -> {}", outcome(&r));
-    if r.is_ok() {
-        accepted.push("tail accepted although it ends before the statement's tip");
+    if r != Err(TailError::StatementTipMismatch) {
+        wrong.push("tail ending before the statement's tip: expected StatementTipMismatch");
     }
 
-    assert!(accepted.is_empty(), "{accepted:#?}");
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 fn outcome(
