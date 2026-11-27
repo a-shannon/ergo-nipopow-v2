@@ -1,7 +1,7 @@
 # Ergo NiPoPoW V2
 ## Strict 128-Bit Incremental Post-Quantum Certification of Ergo Header History
 
-**A. Shannon** · 27 November 2026 · Version 0.4.0
+**A. Shannon** · 27 November 2026 · Version 0.4.1
 
 ---
 
@@ -13,7 +13,7 @@ Any untrusted peer can generate and renew certificates from existing mainnet hea
 
 Five architectural properties make full-history 128-bit verification practical on commodity hardware:
 
-1. **Strict 128-bit end-to-end parameter certification (`V2Production128`):** Every analytical error term (Autolykos v2 rank bound, early-tag survival, geometric audit miss at `Q_A = 2^128 + 1`, global race, and local race) is machine-certified `<= 2^-130` in pure exact rational arithmetic (`scripts/certify_profiles.py`, zero floating point), with total analytical union sum **`<= 2^-128.35 < 2^-128`**.
+1. **Strict 128-bit end-to-end parameter certification (`V2Production128`):** Every analytical error term is machine-certified `<= 2^-130` except the early-tag survival term `eps_early = (2^80 + 1)·(1/2 + 2^-37)^210 = 2^-130 · (1 + 3.06e-9) <= 2^-129.99` (all bounds verified in pure exact rational arithmetic in `scripts/certify_profiles.py`, zero floating point), with total analytical union sum **`<= 2^-128.35 < 2^-128`** (conservative 6-term `<= 2^-128.13 < 2^-128`).
 2. **Append-only SHA-256 Work-Interval MMR:** Leaf preimages commit only to `(profile32, height, W(i-1), W(i), raw_header)` and never hash the snapshot height `n`. Appending blocks invalidates zero prior leaves, internal nodes, or segment proofs, and removes fixed-depth height ceilings (`n < 2^31`, ~8,000 years of Ergo blocks). Canonical deduplicated multiproofs reduce audit sibling digests by ~75%.
 3. **Exact associative segment-transition monoid & constant-depth (`d = 2`) recursion:** The entire deterministic Ergo consensus header relation and all three maturity zones decompose into an exact associative monoid over contiguous 4,096-header segments. Segments prove in parallel and fold at constant depth `d = 2` (capacity `64^2 × 4,096 = 16,777,216` headers, ~64 years) with compile-time child-program VK pinning at every level.
 4. **Heterogeneous Dual-Proof structural certification (`ZisK v1.4.0-alpha` STIR + `OpenVM v2.1.0` SWIRL/WHIR):** The exact byte-identical `BootstrapStatement` is proved simultaneously by two completely independent transparent post-quantum zkVMs over distinct ISAs, finite fields, hash functions, and polynomial commitment schemes, jointly bound before deriving the Fiat-Shamir work audit.
@@ -136,7 +136,7 @@ Both proofs certify the exact same `SHA-256(bincode(BootstrapStatement))` and ar
   - Uses native `Sha256f`, `Blake2br`, and `Blake3f` precompiles and `no_std` in-guest verification (`zisk-verifier::verify_saved_words`).
   - Final `--minimal` STIR proof is **`251,864 B` (`245.96 KiB`)**, verified on pure CPU in **`2 ms`**.
 - **Proof B — OpenVM `v2.1.0` (`RV32IM`, `BabyBear^4`, `Poseidon2`, SWIRL + WHIR):**
-  - Provides an independent defense-in-depth witness over a distinct ISA, base/extension field, algebraic hash family, and polynomial commitment scheme.
+  - Provides an independent defense-in-depth witness over a distinct ISA, base/extension field, algebraic hash family, and polynomial commitment scheme, configured with OpenVM `v2.1.0`'s standard `*_with_100_bits_security` parameters (**100-bit proven RBR security**). In `DualZiskV14OpenVmV21`, both proofs must verify simultaneously (combining 128-bit ZisK STIR soundness with 100-bit audited/Lean-verified OpenVM defense-in-depth); standalone `OpenVmSwirlV21` is refused by default in strict 128-bit verification mode unless explicitly opted in.
   - Core RV32IM, memory consistency, and SHA-2 circuits are formally verified in Lean and externally audited by zkSecurity.
   - Final Root proof is **`546,289 B` (`533.5 KiB`)**, with incremental depth-2 renewal (delta L1 + Root) completing in **`23.25 s`** on a single RTX 4090.
 

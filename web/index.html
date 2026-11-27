@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ergo NiPoPoW V2 — Zero-Backend Browser WASM Light Client</title>
+  <style>
+    :root {
+      --bg: #0d1117; --card: #161b22; --border: #30363d; --fg: #e6edf3;
+      --muted: #8b949e; --accent: #ff5e18; --ok: #3fb950; --err: #f85149; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    body { margin: 0; font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--fg); line-height: 1.5; }
+    main { max-width: 920px; margin: 24px auto; padding: 0 16px 48px; }
+    h1 { font-size: 1.55rem; margin: 0 0 6px; }
+    .sub { color: var(--muted); margin: 0 0 20px; font-size: 0.95rem; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin-bottom: 16px; }
+    .card h2 { font-size: 1.05rem; margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
+    .badge { font-size: 0.72rem; font-family: var(--mono); padding: 2px 7px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
+    .badge.ok { color: var(--ok); border-color: var(--ok); }
+    .badge.err { color: var(--err); border-color: var(--err); }
+    .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 10px; }
+    label { font-size: 0.85rem; color: var(--muted); display: flex; flex-direction: column; gap: 4px; flex: 1 1 220px; }
+    input[type="text"], input[type="number"], input[type="file"] {
+      background: #0d1117; color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 7px 9px; font-family: var(--mono); font-size: 0.82rem;
+    }
+    button {
+      background: var(--accent); color: #fff; border: none; border-radius: 6px; padding: 9px 14px; font-weight: 600; cursor: pointer; font-size: 0.88rem;
+    }
+    button.secondary { background: #21262d; border: 1px solid var(--border); color: var(--fg); }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    pre {
+      background: #090c10; border: 1px solid var(--border); border-radius: 8px; padding: 12px; overflow-x: auto;
+      font-family: var(--mono); font-size: 0.78rem; color: #c9d1d9; max-height: 320px; margin: 12px 0 0;
+    }
+    .kv { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; margin-top: 10px; }
+    .kv div { background: #0d1117; border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; }
+    .kv small { display: block; color: var(--muted); font-size: 0.72rem; }
+    .kv code { font-family: var(--mono); font-size: 0.82rem; word-break: break-all; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Ergo NiPoPoW V2 &mdash; Browser WebAssembly Light Client</h1>
+    <p class="sub">
+      Strict 128-bit (<code>V2Production128</code>) trustless verification from genesis inside V8 WebAssembly
+      (zero backend, zero prover SDK, zero JS imports, indefinite plain-header continuation).
+    </p>
+
+    <section class="card">
+      <h2>1. Load WASM Module &amp; Cold-Verify Genesis Certificate <span id="b1" class="badge">idle</span></h2>
+      <div class="row">
+        <label>WASM binary (<code>ergo_nipopow_v2_light.wasm</code>)
+          <input id="fWasm" type="file" accept=".wasm" />
+        </label>
+        <label>Certificate (<code>.npv2.bin</code> or <code>.gz</code>)
+          <input id="fCert" type="file" />
+        </label>
+        <label>Exact tail (<code>.u32le</code> or <code>.gz</code>)
+          <input id="fTail" type="file" />
+        </label>
+      </div>
+      <div class="row">
+        <button id="btnCold">Cold-Verify 1,827,840 Mainnet Headers in WASM</button>
+        <button id="btnResume" class="secondary">Resume Saved 5.6 KiB Checkpoint (localStorage)</button>
+        <button id="btnClear" class="secondary">Clear Saved Checkpoint</button>
+      </div>
+      <div class="kv" id="kvState">
+        <div><small>Profile / Backend</small><code id="vProf">-</code></div>
+        <div><small>Certified Tip Height</small><code id="vTip">-</code></div>
+        <div><small>Certified Tip State Root (AVL+)</small><code id="vRoot">-</code></div>
+        <div><small>Audit Draws / Cold Time</small><code id="vPerf">-</code></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>2. Live Plain-Header Continuation (Zero STARK Prover Needed) <span id="b2" class="badge">idle</span></h2>
+      <div class="row">
+        <label>Untrusted Ergo Node REST URL (CORS-enabled)
+          <input id="nodeUrl" type="text" value="https://node.ergo.watch" />
+        </label>
+        <label>Headers to fetch &amp; verify (0 = full catch-up to live tip)
+          <input id="syncCount" type="number" value="256" min="0" step="64" />
+        </label>
+      </div>
+      <div class="row">
+        <button id="btnLive" disabled>Fetch &amp; Verify Live Headers from Ergo Node (Zero STARK)</button>
+        <button id="btnTamper" class="secondary" disabled>Flip 1 PoW Bit Tamper Test (Must Fail Closed)</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>3. Trustless Live Post-STARK Block 1,827,976 AVL+ ADProofs &amp; Tx Merkle <span id="b3" class="badge">idle</span></h2>
+      <div class="row">
+        <label>Post-STARK headers (<code>extension_1827841_1827976.u32le</code>)
+          <input id="fExt" type="file" />
+        </label>
+        <label>State proof fixture (<code>mainnet_1827976_live_state_proof.json</code>)
+          <input id="fFix" type="file" accept=".json" />
+        </label>
+      </div>
+      <div class="row">
+        <button id="btnAdProof" disabled>Verify Real Block 1,827,976 ADProofs &amp; Tx Merkle in WASM</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Execution Log</h2>
+      <pre id="log">Ready. Serve this folder with `python3 -m http.server 8080` or select local release files above.</pre>
+    </section>
+  </main>
+
+  <script type="module">
+    const LS_KEY = "ergo_nipopow_v2_checkpoint_v041";
+    const worker = new Worker("./worker.js", { type: "module" });
+    let nextId = 1;
+    const pending = new Map();
+    let wasmReady = false;
+    let checkpointJson = null;
+    let lastExtBytes = null;
+
+    const $ = (id) => document.getElementById(id);
+    const logEl = $("log");
+    function log(msg) {
+      const ts = new Date().toISOString().slice(11, 19);
+      logEl.textContent += `\n[${ts}] ${msg}`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    function setBadge(id, text, cls = "") {
+      const el = $(id);
+      el.textContent = text;
+      el.className = `badge ${cls}`;
+    }
+
+    worker.onmessage = (ev) => {
+      const { id, ok, result, error, progress } = ev.data;
+      const entry = pending.get(id);
+      if (!entry) return;
+      if (progress) {
+        log(`  fetched ${progress.fetched} headers -> height ${progress.tipHeight} / ${progress.targetHeight}`);
+        return;
+      }
+      pending.delete(id);
+      if (ok) entry.resolve(result);
+      else entry.reject(new Error(error));
+    };
+
+    function callWorker(type, payload) {
+      return new Promise((resolve, reject) => {
+        const id = nextId++;
+        pending.set(id, { resolve, reject });
+        worker.postMessage({ id, type, payload });
+      });
+    }
+
+    async function loadInputOrFetch(fileInput, fallbackUrl) {
+      if (fileInput.files && fileInput.files[0]) {
+        return new Uint8Array(await fileInput.files[0].arrayBuffer());
+      }
+      const resp = await fetch(fallbackUrl);
+      if (!resp.ok) {
+        throw new Error(`Select a local file or place ${fallbackUrl} next to web/index.html (HTTP ${resp.status})`);
+      }
+      return new Uint8Array(await resp.arrayBuffer());
+    }
+
+    async function ensureWasm() {
+      if (wasmReady) return;
+      const wasmBytes = await loadInputOrFetch($("fWasm"), "./assets/ergo_nipopow_v2_light.wasm");
+      const info = await callWorker("init", { wasmBytes });
+      wasmReady = true;
+      log(`WASM instantiated in ${info.instantiateMs.toFixed(1)} ms (${(info.rawBytes / 1024).toFixed(1)} KiB raw, zero JS imports)`);
+    }
+
+    function updateCheckpoint(jsonStr, meta = {}) {
+      checkpointJson = jsonStr;
+      localStorage.setItem(LS_KEY, jsonStr);
+      const cp = JSON.parse(jsonStr);
+      $("vTip").textContent = `${cp.tip_height.toLocaleString()} (${cp.tip_id.slice(0, 16)}...)`;
+      $("vRoot").textContent = cp.tip_state_root;
+      if (meta.profile) $("vProf").textContent = `${meta.profile} / ${meta.backend}`;
+      if (meta.perf) $("vPerf").textContent = meta.perf;
+      $("btnLive").disabled = false;
+      $("btnAdProof").disabled = false;
+      $("btnTamper").disabled = false;
+    }
+
+    $("btnCold").onclick = async () => {
+      try {
+        setBadge("b1", "verifying...");
+        await ensureWasm();
+        const certBytes = await loadInputOrFetch($("fCert"), "./assets/ergo-mainnet-1827840-prod128-zisk-stir.npv2.bin.gz");
+        const tailBytes = await loadInputOrFetch($("fTail"), "./assets/tail-1819645-1827840.u32le.gz");
+        log(`Cold-verifying ${(certBytes.length / 1048576).toFixed(2)} MiB cert + ${(tailBytes.length / 1048576).toFixed(2)} MiB tail...`);
+        const res = await callWorker("verifyCert", { certBytes, tailBytes, queryHeight: 1823986 });
+        updateCheckpoint(res.checkpoint_json, {
+          profile: res.profile,
+          backend: res.backend,
+          perf: `${res.audit_draws} draws in ${(res.elapsedMs / 1000).toFixed(3)} s`,
+        });
+        setBadge("b1", "VERIFIED", "ok");
+        log(`PASS: profile=${res.profile} backend=${res.backend} h=${res.query_height} tip=${res.tip_height} cold=${(res.elapsedMs / 1000).toFixed(3)}s (saved 5.6 KiB LightCheckpoint)`);
+      } catch (e) {
+        setBadge("b1", "FAILED", "err");
+        log(`ERROR: ${e.message}`);
+      }
+    };
+
+    $("btnResume").onclick = async () => {
+      const saved = localStorage.getItem(LS_KEY);
+      if (!saved) {
+        log("No saved LightCheckpoint in localStorage yet. Run step 1 once.");
+        return;
+      }
+      try {
+        await ensureWasm();
+        updateCheckpoint(saved, { profile: "V2Production128", backend: "Resumed LightCheckpoint" });
+        setBadge("b1", "RESUMED", "ok");
+        log("Resumed saved 5.6 KiB LightCheckpoint from localStorage (zero STARK download).");
+      } catch (e) {
+        log(`ERROR: ${e.message}`);
+      }
+    };
+
+    $("btnClear").onclick = () => {
+      localStorage.removeItem(LS_KEY);
+      log("Cleared saved LightCheckpoint from localStorage.");
+    };
+
+    $("btnLive").onclick = async () => {
+      try {
+        setBadge("b2", "syncing...");
+        await ensureWasm();
+        const nodeUrl = $("nodeUrl").value.trim();
+        const count = parseInt($("syncCount").value, 10) || 0;
+        log(`Fetching live headers from untrusted node ${nodeUrl} (zero STARK)...`);
+        const res = await callWorker("extendLiveFromNode", { nodeUrl, checkpointJson, count });
+        updateCheckpoint(res.checkpoint_json);
+        setBadge("b2", `TIP ${res.tip_height}`, "ok");
+        log(`EXTEND_TAIL_PASS: ${res.prev_tip_height} -> ${res.tip_height} (+${res.headers_verified} live headers, ${(res.wireBytes / 1024).toFixed(1)} KiB, node tip=${res.nodeTipHeight}) in ${res.elapsedMs.toFixed(1)} ms`);
+      } catch (e) {
+        setBadge("b2", "FAILED", "err");
+        log(`ERROR: ${e.message}`);
+      }
+    };
+
+    $("btnTamper").onclick = async () => {
+      try {
+        await ensureWasm();
+        const ext = lastExtBytes || await loadInputOrFetch($("fExt"), "../crates/ergo-nipopow-v2-light/testdata/extension_1827841_1827976.u32le");
+        const bad = new Uint8Array(ext);
+        bad[bad.length - 1] ^= 0x01;
+        await callWorker("extendTail", { checkpointJson, extBytes: bad });
+        setBadge("b2", "BUG: ACCEPTED", "err");
+        log("UNEXPECTED: tampered header accepted!");
+      } catch (e) {
+        setBadge("b2", "TAMPER REJECTED", "ok");
+        log(`FAIL-CLOSED TAMPER REJECTED OK: ${e.message}`);
+      }
+    };
+
+    $("btnAdProof").onclick = async () => {
+      try {
+        setBadge("b3", "verifying...");
+        await ensureWasm();
+        const extBytes = await loadInputOrFetch($("fExt"), "../crates/ergo-nipopow-v2-light/testdata/extension_1827841_1827976.u32le");
+        const fixtureBytes = await loadInputOrFetch($("fFix"), "../crates/ergo-nipopow-v2-light/testdata/mainnet_1827976_live_state_proof.json");
+        lastExtBytes = extBytes;
+        const res = await callWorker("verifyLiveStateProof", { checkpointJson, extBytes, fixtureBytes });
+        setBadge("b3", "AVL+ VERIFIED", "ok");
+        log(`LIVE_STATE_PROOF_PASS: h=${res.live_height} ad_bytes=${res.ad_bytes} spent=${res.spent_count} created=${res.created_count} avl=${res.prev_state_root.slice(0, 12)}..->${res.next_state_root.slice(0, 12)}.. tx_merkle=${res.tx_merkle_verified} in ${res.elapsedMs.toFixed(1)} ms`);
+      } catch (e) {
+        setBadge("b3", "FAILED", "err");
+        log(`ERROR: ${e.message}`);
+      }
+    };
+  </script>
+</body>
+</html>

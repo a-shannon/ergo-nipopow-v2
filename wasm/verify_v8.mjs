@@ -85,7 +85,7 @@ if (rcCold !== 0) {
 }
 const coldJson = JSON.parse(coldOut);
 console.log(
-  `WASM_V8_COLD_VERIFY_PASS: inst=${instMs.toFixed(1)}ms cold=${(coldMs / 1000).toFixed(3)}s backend=${coldJson.backend} h=${coldJson.query_height} tip=${coldJson.tip_height} draws=${coldJson.audit_draws}`
+  `WASM_V8_COLD_VERIFY_PASS: inst=${instMs.toFixed(1)}ms cold=${(coldMs / 1000).toFixed(3)}s profile=${coldJson.profile} backend=${coldJson.backend} h=${coldJson.query_height} tip=${coldJson.tip_height} draws=${coldJson.audit_draws}`
 );
 
 // [2] Returning-user extend-tail (+136 live mainnet headers, zero STARK, crosses EIP-37 retarget)

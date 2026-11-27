@@ -56,6 +56,7 @@ use ergo_nipopow_v2_core::certificate::{
 use ergo_nipopow_v2_core::daa::decode_compact;
 use ergo_nipopow_v2_core::header::{Header, HeaderPointWitness};
 use ergo_nipopow_v2_core::mmr::{hash_leaf, mainnet_profile32, sha256_bytes, MmrStore};
+use ergo_nipopow_v2_core::profile::ProfileId;
 use ergo_nipopow_v2_core::segment::{
     check_bootstrap_eligibility, merge_segments, BootstrapStatement, BoundaryState, SegmentSummary,
 };
@@ -205,6 +206,12 @@ enum Cmd {
         headers_u32le: PathBuf,
         #[arg(long, default_value_t = 1_823_986)]
         query_height: u32,
+        /// Explicit opt-in required to verify a standalone `OpenVmSwirlV21` certificate
+        /// (whose OpenVM v2.1.0 default parameters target ~100-bit conjectured security
+        /// rather than strict 128-bit; production 128-bit certificates use `ZiskStirV14`
+        /// or `DualZiskV14OpenVmV21`).
+        #[arg(long, default_value_t = false)]
+        allow_non_128_standalone_openvm: bool,
     },
 }
 
@@ -1021,6 +1028,12 @@ fn main() -> Result<()> {
             let zisk_vk = parse_zisk_vk(&zisk_root_vk)?;
             let x_bytes = fs::read(&statement_bin)?;
             let stmt: BootstrapStatement = bincode::deserialize(&x_bytes)?;
+            if stmt.profile != ProfileId::V2Production128 {
+                return Err(eyre!(
+                    "refusing to assemble non-production profile {:?}: V2Production128 is required",
+                    stmt.profile
+                ));
+            }
             let expected_pv = sha256_bytes(&x_bytes);
 
             let t_z = Instant::now();
@@ -1117,6 +1130,12 @@ fn main() -> Result<()> {
             let zisk_vk = parse_zisk_vk(&zisk_root_vk)?;
             let x_bytes = fs::read(&statement_bin)?;
             let stmt: BootstrapStatement = bincode::deserialize(&x_bytes)?;
+            if stmt.profile != ProfileId::V2Production128 {
+                return Err(eyre!(
+                    "refusing to assemble non-production profile {:?}: V2Production128 is required",
+                    stmt.profile
+                ));
+            }
             let expected_pv = sha256_bytes(&x_bytes);
 
             // 1. Verify Proof A: ZisK v1.4.0-alpha (128-bit BLAKE3 STIR/FRI)
@@ -1230,11 +1249,18 @@ fn main() -> Result<()> {
             zisk_root_vk,
             headers_u32le,
             query_height,
+            allow_non_128_standalone_openvm,
         } => {
             let t0 = Instant::now();
             let cert: V2Certificate = bincode::deserialize(&fs::read(&cert_bin)?)?;
             if cert.magic != CERT_MAGIC {
                 return Err(eyre!("invalid V2 certificate magic"));
+            }
+            if cert.statement.profile != ProfileId::V2Production128 {
+                return Err(eyre!(
+                    "refusing certificate with profile {:?}: strict V2Production128 is required",
+                    cert.statement.profile
+                ));
             }
             let x_bytes = bincode::serialize(&cert.statement)?;
             let expected_pv = sha256_bytes(&x_bytes);
@@ -1249,6 +1275,11 @@ fn main() -> Result<()> {
 
             match cert.backend {
                 StructuralBackend::OpenVmSwirlV21 => {
+                    if !allow_non_128_standalone_openvm {
+                        return Err(eyre!(
+                            "refusing standalone OpenVmSwirlV21 certificate in strict 128-bit mode (OpenVM v2.1.0 default parameters target ~100-bit security; use DualZiskV14OpenVmV21 or ZiskStirV14, or pass --allow-non-128-standalone-openvm explicitly)"
+                        ));
+                    }
                     let vk_path = root_agg_vk
                         .as_ref()
                         .ok_or_else(|| eyre!("--root-agg-vk required for OpenVmSwirlV21"))?;
@@ -1336,7 +1367,8 @@ fn main() -> Result<()> {
             let tail_s = t_t.elapsed().as_secs_f64();
 
             println!(
-                "COLD_VERIFY_PASS: backend={:?} h={} tip={} id={} total_work={} draws={} stark={:.3}s audit={:.3}s tail={:.3}s total={:.3}s",
+                "COLD_VERIFY_PASS: profile={:?} backend={:?} h={} tip={} id={} total_work={} draws={} stark={:.3}s audit={:.3}s tail={:.3}s total={:.3}s",
+                cert.statement.profile,
                 cert.backend,
                 vtail.query_height,
                 vtail.tip_height,

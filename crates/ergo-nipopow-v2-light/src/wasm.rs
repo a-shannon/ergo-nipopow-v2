@@ -85,6 +85,7 @@ struct WasmLiveFixture {
 
 #[derive(serde::Serialize)]
 struct WasmColdOutput {
+    profile: String,
     backend: String,
     dual_openvm_present: bool,
     query_height: u32,
@@ -164,6 +165,7 @@ pub unsafe extern "C" fn wasm_verify_light_cert(
         Err(e) => return set_err(e.to_string()),
     };
     let out = WasmColdOutput {
+        profile: format!("{:?}", res.profile),
         backend: format!("{:?}", res.backend),
         dual_openvm_present: res.dual_openvm_half_present,
         query_height: res.tail.query_height,

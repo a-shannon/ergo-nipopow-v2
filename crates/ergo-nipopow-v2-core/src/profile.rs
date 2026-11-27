@@ -17,7 +17,7 @@ pub enum ProfileId {
     /// L=896 (7 * 128 EIP-37 epochs), s=210 (exact 15/64 = 23.4375% fresh chain-quality ratio),
     /// beta=3/4 (982 draws/scale at Q_A = 2^128 + 1), r_theta=1.35.
     /// Certified in pure exact rational arithmetic (scripts/certify_profiles.py):
-    /// eps_rank <= 2^-131.63 (A=151, t=40), eps_early <= 2^-130.00, eps_audit <= 2^-130.30,
+    /// eps_rank <= 2^-131.63 (A=151, t=40), eps_early = 2^-130*(1+3.06e-9) <= 2^-129.99, eps_audit <= 2^-130.30,
     /// eps_global_race <= 2^-131.15, eps_local_race <= 2^-131.20, and total analytical
     /// union sum <= 2^-128.35 < 2^-128.
     V2Production128 = 3,

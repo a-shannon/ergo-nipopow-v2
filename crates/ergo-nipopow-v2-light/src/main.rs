@@ -155,7 +155,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let qh = res.tail.query_header.as_ref().expect("query header");
             println!(
-                "LIGHT_COLD_VERIFY_PASS: backend={:?} dual_openvm_present={} h={} tip={} id={} state_root={} tx_root={} draws={} total={:.3}s",
+                "LIGHT_COLD_VERIFY_PASS: profile={:?} backend={:?} dual_openvm_present={} h={} tip={} id={} state_root={} tx_root={} draws={} total={:.3}s",
+                res.profile,
                 res.backend,
                 res.dual_openvm_half_present,
                 qh.height,

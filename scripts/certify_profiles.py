@@ -207,21 +207,28 @@ def verify_profile(
         exact_logs.append(float(ee / ln2_lo))
 
     union_str = ""
+    def fmt_exp_conservative(exp: float) -> str:
+        # Always round toward zero (never overstate security bits, e.g. -129.999999995 -> -129.99)
+        return f"{math.ceil(exp * 100.0) / 100.0:.2f}"
+
     if check_union_bits is not None:
         eps_union = eps_rank + eps_audit + eps_early + Fraction(2, 1 << race_target_bits)
         assert eps_union < Fraction(1, 1 << check_union_bits), f"{name}: union sum failed"
         eps_union_3 = eps_rank + eps_audit + eps_early + Fraction(3, 1 << race_target_bits)
         assert eps_union_3 < Fraction(1, 1 << check_union_bits), f"{name}: conservative union failed"
         union_str = (
-            f" | union(5) <= 2^({log2_frac(eps_union):.2f}), "
-            f"union(6) <= 2^({log2_frac(eps_union_3):.2f}) < 2^(-{check_union_bits})"
+            f" | union(5) <= 2^({fmt_exp_conservative(log2_frac(eps_union))}), "
+            f"union(6) <= 2^({fmt_exp_conservative(log2_frac(eps_union_3))}) < 2^(-{check_union_bits})"
         )
 
+    early_ratio_minus_1 = float(eps_early * (1 << 130) - 1)
     print(
         f"[PASS] {name}: m_sampled={expected_m_sampled}, m_exact={expected_m_exact}, "
-        f"draws={draws_per_scale} | eps_rank<=2^({log2_frac(eps_rank):.2f}), "
-        f"eps_early<=2^({log2_frac(eps_early):.2f}), eps_audit<=2^({log2_frac(eps_audit):.2f}), "
-        f"race_s<=2^({max(sampled_logs):.2f}), race_e<=2^({max(exact_logs):.2f}){union_str}"
+        f"draws={draws_per_scale} | eps_rank<=2^({fmt_exp_conservative(log2_frac(eps_rank))}), "
+        f"eps_early=2^(-130)*(1+{early_ratio_minus_1:.2e})<=2^({fmt_exp_conservative(log2_frac(eps_early))}), "
+        f"eps_audit<=2^({fmt_exp_conservative(log2_frac(eps_audit))}), "
+        f"race_s<=2^({fmt_exp_conservative(max(sampled_logs))}), "
+        f"race_e<=2^({fmt_exp_conservative(max(exact_logs))}){union_str}"
     )
 
 

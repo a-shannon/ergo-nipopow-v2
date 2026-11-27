@@ -42,6 +42,7 @@ pub const PINNED_ZISK_ROOT_VK_PROD128: [u64; 4] = [
 #[derive(Debug)]
 pub enum LightError {
     InvalidMagic,
+    UnsupportedProfile(ProfileId),
     UnsupportedBackend(&'static str),
     Decompress(String),
     Decode(String),
@@ -56,6 +57,11 @@ impl std::fmt::Display for LightError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidMagic => write!(f, "invalid V2Certificate magic"),
+            Self::UnsupportedProfile(p) => write!(
+                f,
+                "unsupported profile {:?}: production light verifier requires V2Production128",
+                p
+            ),
             Self::UnsupportedBackend(msg) => write!(f, "unsupported backend: {msg}"),
             Self::Decompress(e) => write!(f, "gzip decompression failed: {e}"),
             Self::Decode(e) => write!(f, "decode error: {e}"),
@@ -175,6 +181,7 @@ pub fn verify_zisk_root_proof_bytes(
 /// Complete light-client verification output.
 #[derive(Clone, Debug)]
 pub struct VerifiedLightCertificate {
+    pub profile: ProfileId,
     pub backend: StructuralBackend,
     pub dual_openvm_half_present: bool,
     pub statement_sha256: [u8; 32],
@@ -184,6 +191,7 @@ pub struct VerifiedLightCertificate {
 
 /// Cold-verify a raw or gzip-compressed `V2Certificate` (`ZiskStirV14` or ZisK STIR half of
 /// `DualZiskV14OpenVmV21`) plus its exact modern tail using zero prover SDK and zero GPU.
+/// Enforces `cert.statement.profile == ProfileId::V2Production128` fail-closed.
 pub fn verify_light_certificate(
     cert_bytes: &[u8],
     tail_u32le_bytes: &[u8],
@@ -195,6 +203,9 @@ pub fn verify_light_certificate(
         .map_err(|e| LightError::Decode(format!("certificate bincode: {e}")))?;
     if cert.magic != CERT_MAGIC {
         return Err(LightError::InvalidMagic);
+    }
+    if cert.statement.profile != ProfileId::V2Production128 {
+        return Err(LightError::UnsupportedProfile(cert.statement.profile));
     }
     let x_bytes = bincode::serialize(&cert.statement)
         .map_err(|e| LightError::Decode(format!("statement bincode: {e}")))?;
@@ -239,6 +250,7 @@ pub fn verify_light_certificate(
         .map_err(|e| LightError::Tail(format!("{e:?}")))?;
 
     Ok(VerifiedLightCertificate {
+        profile: cert.statement.profile,
         backend: cert.backend,
         dual_openvm_half_present,
         statement_sha256: expected_pv,
@@ -689,5 +701,42 @@ mod tests {
         let winner = select_best(ProfileId::V2Production128, 1_823_986, &cands).unwrap();
         assert_eq!(winner.certified_work, 250);
         assert_eq!(winner.header_id, [0x33; 32]); // equal work -> lexicographically smaller canonical_bytes ("candidate-a" < "candidate-b")
+    }
+
+    #[test]
+    fn downgraded_profile_certificate_is_rejected_fail_closed() {
+        use ergo_nipopow_v2_core::audit::AuditBundle;
+        use ergo_nipopow_v2_core::mmr::MmrMultiproof;
+        use ergo_nipopow_v2_core::segment::BootstrapStatement;
+
+        let ckpt: LightCheckpoint =
+            serde_json::from_str(include_str!("../testdata/checkpoint_1827840.json")).unwrap();
+        let mut downgraded_stmt: BootstrapStatement = ckpt.bootstrap.clone();
+        downgraded_stmt.profile = ProfileId::V2Production;
+        let cert = V2Certificate {
+            magic: CERT_MAGIC,
+            backend: StructuralBackend::ZiskStirV14,
+            statement: downgraded_stmt,
+            structural_proof: vec![0u8; 64],
+            audit: AuditBundle {
+                leaves: Vec::new(),
+                multiproof: MmrMultiproof {
+                    siblings: Vec::new(),
+                    untouched_peaks: Vec::new(),
+                },
+            },
+        };
+        let cert_bytes = bincode::serialize(&cert).unwrap();
+        let err = verify_light_certificate(
+            &cert_bytes,
+            &[],
+            1_823_986,
+            &PINNED_ZISK_ROOT_VK_PROD128,
+        )
+        .unwrap_err();
+        match err {
+            LightError::UnsupportedProfile(ProfileId::V2Production) => {}
+            other => panic!("expected UnsupportedProfile(V2Production), got {other:?}"),
+        }
     }
 }

@@ -110,6 +110,26 @@ jobs:
             crates/ergo-nipopow-v2-light/testdata/extension_1827841_1827976.u32le \
             crates/ergo-nipopow-v2-light/testdata/mainnet_1827976_live_state_proof.json
 
+          echo "=== Verify browser SDK (web/nipopow-v2.js) cold-verify + extend against compiled .wasm ==="
+          node --input-type=module -e '
+            import fs from "node:fs";
+            import { NiPoPoWV2Wasm } from "./web/nipopow-v2.js";
+            const wasm = fs.readFileSync("target/wasm32-unknown-unknown/release/ergo_nipopow_v2_light.wasm");
+            const cert = fs.readFileSync("work-light/stir.npv2.bin.gz");
+            const tail = fs.readFileSync("work-light/tail.u32le.gz");
+            const ext = fs.readFileSync("crates/ergo-nipopow-v2-light/testdata/extension_1827841_1827976.u32le");
+            const client = await NiPoPoWV2Wasm.load(wasm);
+            const verified = client.verifyCert(cert, tail);
+            if (verified.profile !== "V2Production128" || verified.tip_height !== 1827840) {
+              throw new Error("unexpected verifyCert result: " + JSON.stringify(verified));
+            }
+            const extended = client.extendTail(verified.checkpoint_json, ext);
+            if (extended.tip_height !== 1827976) {
+              throw new Error("unexpected extendTail tip: " + extended.tip_height);
+            }
+            console.log("WEB_SDK_CI_PASS: profile=" + verified.profile + " tip=" + verified.tip_height + " -> " + extended.tip_height);
+          '
+
           echo "=== Regression test: verify_exact_tail binds strictly to certified statement tip (PR #1) ==="
           NPV2_CERT_BIN="$PWD/release-assets/ergo-mainnet-1827840-prod128-zisk-stir.npv2.bin" \
           NPV2_TAIL_U32LE="$PWD/release-assets/tail-1819645-1827840.u32le" \
@@ -172,3 +192,22 @@ jobs:
             --zisk-root-vk "$ZISK_VK" \
             --headers-u32le release-assets/tail-1819645-1827840.u32le \
             --query-height 1823986
+
+          echo "=== Regression test (Issue #2): profile-downgraded cert refused fail-closed ==="
+          python3 -c '
+          b = bytearray(open("release-assets/ergo-mainnet-1827840-prod128-zisk-stir.npv2.bin", "rb").read())
+          assert b[:8] == b"NPV2MMR1"
+          assert int.from_bytes(b[12:16], "little") == 2  # V2Production128
+          b[12:16] = (0).to_bytes(4, "little")            # V2Production (downgraded)
+          open("release-assets/downgraded.npv2.bin", "wb").write(b)
+          '
+          if "$AGG" verify-cert \
+            --cert-bin release-assets/downgraded.npv2.bin \
+            --zisk-root-vk "$ZISK_VK" \
+            --headers-u32le release-assets/tail-1819645-1827840.u32le >/tmp/downgrade.out 2>&1; then
+            echo "ERROR: downgraded profile certificate was unexpectedly accepted" >&2
+            cat /tmp/downgrade.out >&2
+            exit 1
+          fi
+          grep -q "strict V2Production128 is required" /tmp/downgrade.out
+          echo "PROFILE_DOWNGRADE_CI_REFUSAL_OK"
