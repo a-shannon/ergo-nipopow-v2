@@ -3,14 +3,14 @@
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use ergo_nipopow_v2_core::state_proof::ErgoTxMerkleProof;
 use ergo_nipopow_v2_core::tail::LightCheckpoint;
 use ergo_nipopow_v2_light::{
-    compare_peer_certificates, extend_light_checkpoint_bytes, parse_zisk_vk,
-    verify_block_ad_proofs, verify_light_certificate, verify_tx_inclusion,
+    compare_peer_certificates, extend_light_checkpoint_bytes_at_time, parse_zisk_vk,
+    verify_block_ad_proofs_with_lookups, verify_light_certificate, verify_tx_inclusion,
     PINNED_ZISK_ROOT_VK_PROD128,
 };
 use flate2::write::GzEncoder;
@@ -98,6 +98,8 @@ struct LiveStateProofFixture {
     height: u32,
     prev_height: u32,
     ad_proofs_hex: String,
+    #[serde(default)]
+    lookup_box_ids: Vec<String>,
     spent_box_ids: Vec<String>,
     created_boxes: Vec<RawCreatedBox>,
     merkle_tx_proof: RawMerkleProof,
@@ -153,12 +155,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(cp_path) = save_checkpoint {
                 fs::write(&cp_path, serde_json::to_vec_pretty(&res.tail.checkpoint)?)?;
             }
-            let qh = res.tail.query_header.as_ref().expect("query header");
+            let qh = res
+                .tail
+                .query_header
+                .as_ref()
+                .ok_or("missing query header summary (query_height may equal bootstrap_height)")?;
             println!(
-                "LIGHT_COLD_VERIFY_PASS: profile={:?} backend={:?} dual_openvm_present={} h={} tip={} id={} state_root={} tx_root={} draws={} total={:.3}s",
+                "LIGHT_COLD_VERIFY_PASS: profile={:?} container={:?} verified_proof=\"{}\" dual_openvm_present={} openvm_half_verified={} h={} tip={} id={} state_root={} tx_root={} draws={} total={:.3}s",
                 res.profile,
                 res.backend,
+                res.verified_proof,
                 res.dual_openvm_half_present,
+                res.openvm_half_verified,
                 qh.height,
                 res.tail.tip_height,
                 hex::encode(qh.id),
@@ -177,7 +185,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let cp: LightCheckpoint = serde_json::from_slice(&fs::read(&checkpoint_in)?)?;
             let old_tip = cp.tip_height;
             let raw = fs::read(&new_headers_u32le)?;
-            let (next, appended) = extend_light_checkpoint_bytes(&cp, &raw)?;
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_millis() as i64);
+            let (next, appended) = extend_light_checkpoint_bytes_at_time(&cp, &raw, now_ms)?;
             fs::write(&checkpoint_out, serde_json::to_vec_pretty(&next)?)?;
             println!(
                 "LIGHT_EXTEND_TAIL_PASS: {} -> {} (+{} headers, {} B wire, zero STARK) tip_id={} state_root={} elapsed={:.3}s",
@@ -230,7 +242,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
 
             let t_st = Instant::now();
-            let new_root = verify_block_ad_proofs(prev_hdr, curr_hdr, &ad_bytes, &spent, &created)?;
+            let new_root =
+                verify_block_ad_proofs_with_lookups(prev_hdr, curr_hdr, &ad_bytes, &[], &spent, &created)?;
             let tx_proof = ErgoTxMerkleProof {
                 leaf_data: hex32(&fix.merkle_tx_proof_1823985.leaf_data)?,
                 levels: fix
@@ -247,13 +260,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut bad_ad = ad_bytes.clone();
             bad_ad[100] ^= 0x01;
             assert!(
-                verify_block_ad_proofs(prev_hdr, curr_hdr, &bad_ad, &spent, &created).is_err(),
+                verify_block_ad_proofs_with_lookups(prev_hdr, curr_hdr, &bad_ad, &[], &spent, &created).is_err(),
                 "TAMPER FAILED: modified ADProofs passed!"
             );
             let mut bad_created = created.clone();
             bad_created[0].1[0] ^= 0x01;
             assert!(
-                verify_block_ad_proofs(prev_hdr, curr_hdr, &ad_bytes, &spent, &bad_created)
+                verify_block_ad_proofs_with_lookups(prev_hdr, curr_hdr, &ad_bytes, &[], &spent, &bad_created)
                     .is_err(),
                 "TAMPER FAILED: modified UTXO box passed!"
             );
@@ -287,7 +300,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let ext_raw = fs::read(&new_headers_u32le)?;
             let fix: LiveStateProofFixture =
                 serde_json::from_slice(&fs::read(&state_fixture_json)?)?;
-            let (next, hdrs) = extend_light_checkpoint_bytes(&cp, &ext_raw)?;
+            let (next, hdrs) = extend_light_checkpoint_bytes_at_time(&cp, &ext_raw, None)?;
             let prev_hdr = hdrs
                 .iter()
                 .find(|h| h.height == fix.prev_height)
@@ -298,6 +311,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .ok_or("height not found in extension")?;
 
             let ad_bytes = hex::decode(&fix.ad_proofs_hex)?;
+            let lookups: Vec<[u8; 32]> = fix
+                .lookup_box_ids
+                .iter()
+                .map(|s| hex32(s))
+                .collect::<Result<Vec<_>, _>>()?;
             let spent: Vec<[u8; 32]> = fix
                 .spent_box_ids
                 .iter()
@@ -310,7 +328,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
 
             let t_st = Instant::now();
-            let new_root = verify_block_ad_proofs(prev_hdr, curr_hdr, &ad_bytes, &spent, &created)?;
+            let new_root = verify_block_ad_proofs_with_lookups(
+                prev_hdr, curr_hdr, &ad_bytes, &lookups, &spent, &created,
+            )?;
             let tx_proof = ErgoTxMerkleProof {
                 leaf_data: hex32(&fix.merkle_tx_proof.leaf_data)?,
                 levels: fix
@@ -326,13 +346,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Negative tamper checks on live extended tip
             let mut bad_ad = ad_bytes.clone();
             bad_ad[42] ^= 0x01;
-            assert!(verify_block_ad_proofs(prev_hdr, curr_hdr, &bad_ad, &spent, &created).is_err());
+            assert!(verify_block_ad_proofs_with_lookups(
+                prev_hdr, curr_hdr, &bad_ad, &lookups, &spent, &created
+            )
+            .is_err());
             let mut bad_created = created.clone();
             bad_created[0].1[10] ^= 0x01;
-            assert!(
-                verify_block_ad_proofs(prev_hdr, curr_hdr, &ad_bytes, &spent, &bad_created)
-                    .is_err()
-            );
+            assert!(verify_block_ad_proofs_with_lookups(
+                prev_hdr,
+                curr_hdr,
+                &ad_bytes,
+                &lookups,
+                &spent,
+                &bad_created
+            )
+            .is_err());
             let mut bad_tx = tx_proof.clone();
             bad_tx.leaf_data[0] ^= 0x01;
             assert!(verify_tx_inclusion(curr_hdr, &bad_tx).is_err());

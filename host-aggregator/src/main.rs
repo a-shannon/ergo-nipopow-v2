@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use bincode::Options;
 use clap::{Parser, Subcommand};
 use eyre::{eyre, Result};
 use openvm_recursion_circuit::batch_constraint::commit_child_vk;
@@ -207,12 +208,54 @@ enum Cmd {
         #[arg(long, default_value_t = 1_823_986)]
         query_height: u32,
         /// Explicit opt-in required to verify a standalone `OpenVmSwirlV21` certificate
-        /// (whose OpenVM v2.1.0 default parameters target ~100-bit conjectured security
-        /// rather than strict 128-bit; production 128-bit certificates use `ZiskStirV14`
+        /// (whose OpenVM v2.1.0 default parameters target 100-bit proven RBR security
+        /// rather than strict 128-bit; production certificates use `ZiskStirV14`
         /// or `DualZiskV14OpenVmV21`).
         #[arg(long, default_value_t = false)]
         allow_non_128_standalone_openvm: bool,
+        /// Explicit opt-in required to override the compile-time pinned `v0.4.0`
+        /// reproducible ZisK root VK and OpenVM `root-agg.vk` / `root-baseline.json` SHA-256 hashes.
+        #[arg(long, default_value_t = false)]
+        unsafe_override_vk: bool,
     },
+}
+
+const PINNED_ZISK_ROOT_VK_PROD128: [u64; 4] = [
+    11772000642296811191,
+    2917608110684279903,
+    7269122849900466967,
+    12697094355253129467,
+];
+const PINNED_OPENVM_ROOT_AGG_VK_SHA256: &str =
+    "15d415ec0e8dc7910c771c0fc699b0ebec5a42512c595a8f5e9dcd962e6c1d2b";
+const PINNED_OPENVM_ROOT_BASELINE_SHA256: &str =
+    "4e1441e68c98cf3c99aaf5095ed79f5a1e4bd0ac88c785b6ad51e6a7e0a77d58";
+const MAX_CERT_RAW_BYTES: usize = 16 * 1024 * 1024;
+const MAX_HEADER_BYTES: usize = 514;
+const MAX_VK_FILE_BYTES: usize = 4 * 1024 * 1024;
+
+fn read_bounded_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
+    let meta = fs::metadata(path)?;
+    if meta.len() > max_bytes as u64 {
+        return Err(eyre!(
+            "file {} size {} B exceeds cap {} B",
+            path.display(),
+            meta.len(),
+            max_bytes
+        ));
+    }
+    let f = File::open(path)?;
+    let mut buf = Vec::new();
+    f.take((max_bytes as u64).saturating_add(1))
+        .read_to_end(&mut buf)?;
+    if buf.len() > max_bytes {
+        return Err(eyre!(
+            "file {} exceeds cap {} B while reading",
+            path.display(),
+            max_bytes
+        ));
+    }
+    Ok(buf)
 }
 
 fn parse_zisk_vk(s: &str) -> Result<[u64; 4]> {
@@ -493,12 +536,20 @@ fn prove_l1_batch(
 fn read_u32le_headers(path: &Path) -> Result<Vec<Vec<u8>>> {
     let f = File::open(path)?;
     let mut r = BufReader::with_capacity(8 * 1024 * 1024, f);
-    let mut headers = Vec::with_capacity(1_900_000);
+    let mut headers = Vec::new();
     let mut len_buf = [0u8; 4];
     loop {
         match r.read_exact(&mut len_buf) {
             Ok(()) => {
                 let len = u32::from_le_bytes(len_buf) as usize;
+                if len == 0 || len > MAX_HEADER_BYTES {
+                    return Err(eyre!(
+                        "invalid u32le header length {} in {} (expected 1..={})",
+                        len,
+                        path.display(),
+                        MAX_HEADER_BYTES
+                    ));
+                }
                 let mut raw = vec![0u8; len];
                 r.read_exact(&mut raw)?;
                 headers.push(raw);
@@ -1250,9 +1301,15 @@ fn main() -> Result<()> {
             headers_u32le,
             query_height,
             allow_non_128_standalone_openvm,
+            unsafe_override_vk,
         } => {
             let t0 = Instant::now();
-            let cert: V2Certificate = bincode::deserialize(&fs::read(&cert_bin)?)?;
+            let cert_bytes = read_bounded_file(&cert_bin, MAX_CERT_RAW_BYTES)?;
+            let cert: V2Certificate = bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .with_limit(MAX_CERT_RAW_BYTES as u64)
+                .reject_trailing_bytes()
+                .deserialize(&cert_bytes)?;
             if cert.magic != CERT_MAGIC {
                 return Err(eyre!("invalid V2 certificate magic"));
             }
@@ -1264,6 +1321,41 @@ fn main() -> Result<()> {
             }
             let x_bytes = bincode::serialize(&cert.statement)?;
             let expected_pv = sha256_bytes(&x_bytes);
+
+            let check_openvm_pins = |vk_path: &Path, bl_path: &Path| -> Result<()> {
+                let vk_bytes = read_bounded_file(vk_path, MAX_VK_FILE_BYTES)?;
+                let bl_bytes = read_bounded_file(bl_path, MAX_VK_FILE_BYTES)?;
+                let vk_sha = hex::encode(sha256_bytes(&vk_bytes));
+                let bl_sha = hex::encode(sha256_bytes(&bl_bytes));
+                if !unsafe_override_vk {
+                    if vk_sha != PINNED_OPENVM_ROOT_AGG_VK_SHA256 {
+                        return Err(eyre!(
+                            "root-agg.vk SHA-256 mismatch: got {vk_sha}, pinned {PINNED_OPENVM_ROOT_AGG_VK_SHA256} (pass --unsafe-override-vk to test custom VKs)"
+                        ));
+                    }
+                    if bl_sha != PINNED_OPENVM_ROOT_BASELINE_SHA256 {
+                        return Err(eyre!(
+                            "root-baseline.json SHA-256 mismatch: got {bl_sha}, pinned {PINNED_OPENVM_ROOT_BASELINE_SHA256} (pass --unsafe-override-vk to test custom VKs)"
+                        ));
+                    }
+                }
+                Ok(())
+            };
+
+            let resolve_zisk_vk = |zvk_opt: &Option<String>| -> Result<[u64; 4]> {
+                let zvk = match zvk_opt {
+                    Some(s) => parse_zisk_vk(s)?,
+                    None => PINNED_ZISK_ROOT_VK_PROD128,
+                };
+                if !unsafe_override_vk && zvk != PINNED_ZISK_ROOT_VK_PROD128 {
+                    return Err(eyre!(
+                        "zisk-root-vk {:?} does not match pinned v0.4.0 VK {:?} (pass --unsafe-override-vk to test custom VKs)",
+                        zvk,
+                        PINNED_ZISK_ROOT_VK_PROD128
+                    ));
+                }
+                Ok(zvk)
+            };
 
             let t_s = Instant::now();
             let mut openvm_ctx: Option<(
@@ -1277,7 +1369,7 @@ fn main() -> Result<()> {
                 StructuralBackend::OpenVmSwirlV21 => {
                     if !allow_non_128_standalone_openvm {
                         return Err(eyre!(
-                            "refusing standalone OpenVmSwirlV21 certificate in strict 128-bit mode (OpenVM v2.1.0 default parameters target ~100-bit security; use DualZiskV14OpenVmV21 or ZiskStirV14, or pass --allow-non-128-standalone-openvm explicitly)"
+                            "refusing standalone OpenVmSwirlV21 certificate in strict 128-bit mode (OpenVM v2.1.0 default parameters target 100-bit proven RBR security; use DualZiskV14OpenVmV21 or ZiskStirV14, or pass --allow-non-128-standalone-openvm explicitly)"
                         ));
                     }
                     let vk_path = root_agg_vk
@@ -1286,6 +1378,7 @@ fn main() -> Result<()> {
                     let bl_path = root_baseline
                         .as_ref()
                         .ok_or_else(|| eyre!("--root-baseline required for OpenVmSwirlV21"))?;
+                    check_openvm_pins(vk_path, bl_path)?;
                     let agg_vk: MultiStarkVerifyingKey<SC> = read_object_from_file(vk_path)?;
                     let baseline_json: VerificationBaselineJson = read_from_file_json(bl_path)?;
                     let baseline: VerificationBaseline = baseline_json.into();
@@ -1299,20 +1392,14 @@ fn main() -> Result<()> {
                     openvm_ctx = Some((agg_vk, baseline, prf));
                 }
                 StructuralBackend::ZiskStirV14 => {
-                    let zvk_str = zisk_root_vk
-                        .as_ref()
-                        .ok_or_else(|| eyre!("--zisk-root-vk required for ZiskStirV14"))?;
-                    let zvk = parse_zisk_vk(zvk_str)?;
+                    let zvk = resolve_zisk_vk(&zisk_root_vk)?;
                     verify_zisk_root_proof_bytes(&cert.structural_proof, &zvk, &expected_pv)?;
                     zisk_ctx = Some((zvk, cert.structural_proof.clone()));
                 }
                 StructuralBackend::DualZiskV14OpenVmV21 => {
                     let dual = DualStructuralProof::decode_canonical(&cert.structural_proof)
                         .map_err(|e| eyre!("decode DualStructuralProof: {e:?}"))?;
-                    let zvk_str = zisk_root_vk
-                        .as_ref()
-                        .ok_or_else(|| eyre!("--zisk-root-vk required for DualZiskV14OpenVmV21"))?;
-                    let zvk = parse_zisk_vk(zvk_str)?;
+                    let zvk = resolve_zisk_vk(&zisk_root_vk)?;
                     verify_zisk_root_proof_bytes(&dual.zisk_proof, &zvk, &expected_pv)?;
                     zisk_ctx = Some((zvk, dual.zisk_proof));
 
@@ -1322,6 +1409,7 @@ fn main() -> Result<()> {
                     let bl_path = root_baseline
                         .as_ref()
                         .ok_or_else(|| eyre!("--root-baseline required for DualZiskV14OpenVmV21"))?;
+                    check_openvm_pins(vk_path, bl_path)?;
                     let agg_vk: MultiStarkVerifyingKey<SC> = read_object_from_file(vk_path)?;
                     let baseline_json: VerificationBaselineJson = read_from_file_json(bl_path)?;
                     let baseline: VerificationBaseline = baseline_json.into();
@@ -1348,7 +1436,12 @@ fn main() -> Result<()> {
             let audit_s = t_a.elapsed().as_secs_f64();
 
             let raw_headers = read_u32le_headers(&headers_u32le)?;
-            let expected_tail_len = (cert.statement.tip_height - cert.statement.bootstrap_height) as usize;
+            let expected_tail_len = cert
+                .statement
+                .tip_height
+                .checked_sub(cert.statement.bootstrap_height)
+                .ok_or_else(|| eyre!("tip_height < bootstrap_height"))?
+                as usize;
             let tail_slice: &[Vec<u8>] = if raw_headers.len() == expected_tail_len {
                 &raw_headers[..]
             } else if raw_headers.len() == cert.statement.tip_height as usize {
@@ -1366,10 +1459,16 @@ fn main() -> Result<()> {
                 .map_err(|e| eyre!("tail failed: {e:?}"))?;
             let tail_s = t_t.elapsed().as_secs_f64();
 
+            let sec_label = match cert.backend {
+                StructuralBackend::OpenVmSwirlV21 => "100-bit-RBR-standalone-OpenVM",
+                StructuralBackend::ZiskStirV14 => "128-bit-ZisK-STIR",
+                StructuralBackend::DualZiskV14OpenVmV21 => "128-bit-ZisK-STIR+100-bit-OpenVM-Dual",
+            };
             println!(
-                "COLD_VERIFY_PASS: profile={:?} backend={:?} h={} tip={} id={} total_work={} draws={} stark={:.3}s audit={:.3}s tail={:.3}s total={:.3}s",
+                "COLD_VERIFY_PASS: profile={:?} backend={:?} security={} h={} tip={} id={} total_work={} draws={} stark={:.3}s audit={:.3}s tail={:.3}s total={:.3}s",
                 cert.statement.profile,
                 cert.backend,
+                sec_label,
                 vtail.query_height,
                 vtail.tip_height,
                 hex::encode(vtail.query_header_id),

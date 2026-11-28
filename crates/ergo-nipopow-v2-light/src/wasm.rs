@@ -1,6 +1,14 @@
 //! Minimal zero-dependency `wasm32-unknown-unknown` C-ABI exports for executing
 //! `ergo-nipopow-v2-light` directly inside V8 (Node.js, Chromium, Android WebView)
 //! and any standard WebAssembly host without `wasm-bindgen` or npm toolchains.
+//!
+//! Host ABI contract:
+//! - Callers allocate input buffers via `wasm_alloc(len)` (capped at `MAX_EXTENSION_RAW_BYTES`;
+//!   returns `0` on overflow/oversized requests) and release them with `wasm_dealloc(ptr, len)`
+//!   inside a `try / finally` block.
+//! - Return code `0` indicates success; non-zero indicates fail-closed rejection.
+//! - `wasm_last_output_ptr()` / `wasm_last_output_len()` point to UTF-8 JSON (on `0`) or
+//!   UTF-8 error text (on non-zero) valid until the next output-producing call.
 
 use std::cell::RefCell;
 
@@ -8,8 +16,10 @@ use ergo_nipopow_v2_core::state_proof::ErgoTxMerkleProof;
 use ergo_nipopow_v2_core::tail::LightCheckpoint;
 
 use crate::{
-    extend_light_checkpoint_bytes, verify_block_ad_proofs, verify_checkpoint_block_state,
-    verify_light_certificate, verify_tx_inclusion, PINNED_ZISK_ROOT_VK_PROD128,
+    extend_light_checkpoint_bytes_at_time, verify_block_ad_proofs_with_lookups,
+    verify_checkpoint_block_state, verify_light_certificate, verify_tx_inclusion,
+    MAX_EXTENSION_RAW_BYTES, MAX_JSON_INPUT_BYTES, PINNED_ZISK_ROOT_VK_PROD128,
+    PROD128_MIN_CONFIRMATIONS,
 };
 
 thread_local! {
@@ -29,7 +39,13 @@ fn set_err(msg: impl AsRef<str>) -> i32 {
 
 #[no_mangle]
 pub extern "C" fn wasm_alloc(len: usize) -> *mut u8 {
-    let mut buf = Vec::<u8>::with_capacity(len);
+    if len > MAX_EXTENSION_RAW_BYTES {
+        return core::ptr::null_mut();
+    }
+    let mut buf = Vec::<u8>::new();
+    if buf.try_reserve_exact(len).is_err() {
+        return core::ptr::null_mut();
+    }
     let ptr = buf.as_mut_ptr();
     std::mem::forget(buf);
     ptr
@@ -37,7 +53,7 @@ pub extern "C" fn wasm_alloc(len: usize) -> *mut u8 {
 
 #[no_mangle]
 pub unsafe extern "C" fn wasm_dealloc(ptr: *mut u8, len: usize) {
-    if !ptr.is_null() {
+    if !ptr.is_null() && len <= MAX_EXTENSION_RAW_BYTES {
         drop(Vec::from_raw_parts(ptr, 0, len));
     }
 }
@@ -52,12 +68,21 @@ pub extern "C" fn wasm_last_output_len() -> usize {
     LAST_OUTPUT.with(|cell| cell.borrow().len())
 }
 
-unsafe fn slice_from_raw<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
-    if len == 0 {
-        &[]
-    } else {
-        std::slice::from_raw_parts(ptr, len)
+unsafe fn slice_from_raw_bounded<'a>(
+    ptr: *const u8,
+    len: usize,
+    max_len: usize,
+) -> Result<&'a [u8], String> {
+    if len > max_len {
+        return Err(format!("input buffer {} B exceeds cap {} B", len, max_len));
     }
+    if len == 0 {
+        return Ok(&[]);
+    }
+    if ptr.is_null() {
+        return Err("null pointer with non-zero length".into());
+    }
+    Ok(std::slice::from_raw_parts(ptr, len))
 }
 
 #[derive(serde::Deserialize)]
@@ -78,6 +103,8 @@ struct WasmLiveFixture {
     height: u32,
     prev_height: u32,
     ad_proofs_hex: String,
+    #[serde(default)]
+    lookup_box_ids: Vec<String>,
     spent_box_ids: Vec<String>,
     created_boxes: Vec<WasmCreatedBox>,
     merkle_tx_proof: WasmMerkleProof,
@@ -87,7 +114,9 @@ struct WasmLiveFixture {
 struct WasmColdOutput {
     profile: String,
     backend: String,
+    verified_proof: String,
     dual_openvm_present: bool,
+    openvm_half_verified: bool,
     query_height: u32,
     tip_height: u32,
     query_id: String,
@@ -113,9 +142,43 @@ struct WasmLiveStateOutput {
     prev_state_root: String,
     next_state_root: String,
     ad_bytes: usize,
+    lookup_count: usize,
     spent_count: usize,
     created_count: usize,
     tx_merkle_verified: bool,
+    verified_tx_id: String,
+}
+
+#[derive(serde::Deserialize)]
+struct WasmCheckpointBlockInput {
+    ad_proofs_hex: String,
+    #[serde(default)]
+    lookup_box_ids: Vec<String>,
+    spent_box_ids: Vec<String>,
+    created_boxes: Vec<WasmCreatedBox>,
+    merkle_tx_proof: Option<WasmMerkleProof>,
+    #[serde(default)]
+    expected_tx_id: Option<String>,
+    #[serde(default)]
+    min_confirmations: Option<u32>,
+}
+
+#[derive(serde::Serialize)]
+struct WasmCheckpointBlockOutput {
+    height: u32,
+    block_id: String,
+    tip_height: u32,
+    confirmations: u32,
+    confirmed_k0: bool,
+    header_chain_len: usize,
+    prev_state_root: String,
+    next_state_root: String,
+    ad_bytes: usize,
+    lookup_count: usize,
+    spent_count: usize,
+    created_count: usize,
+    tx_merkle_verified: bool,
+    verified_tx_id: Option<String>,
 }
 
 fn hex32(s: &str) -> Result<[u8; 32], String> {
@@ -125,7 +188,8 @@ fn hex32(s: &str) -> Result<[u8; 32], String> {
         .map_err(|_| "expected 32-byte hex".to_string())
 }
 
-/// Cold-verify a raw or gzip-compressed 128-bit certificate + exact tail inside WASM.
+/// Cold-verify a raw or gzip-compressed `V2Production128` certificate + exact tail inside WASM.
+/// Verifies the 128-bit ZisK STIR half only (`openvm_half_verified: false`).
 #[no_mangle]
 pub unsafe extern "C" fn wasm_verify_light_cert(
     cert_ptr: *const u8,
@@ -136,12 +200,21 @@ pub unsafe extern "C" fn wasm_verify_light_cert(
     vk_ptr: *const u8,
     vk_len: usize,
 ) -> i32 {
-    let cert_bytes = slice_from_raw(cert_ptr, cert_len);
-    let tail_bytes = slice_from_raw(tail_ptr, tail_len);
+    let cert_bytes = match slice_from_raw_bounded(cert_ptr, cert_len, MAX_EXTENSION_RAW_BYTES) {
+        Ok(b) => b,
+        Err(e) => return set_err(e),
+    };
+    let tail_bytes = match slice_from_raw_bounded(tail_ptr, tail_len, MAX_EXTENSION_RAW_BYTES) {
+        Ok(b) => b,
+        Err(e) => return set_err(e),
+    };
     let vk = if vk_len == 0 {
         PINNED_ZISK_ROOT_VK_PROD128
     } else if vk_len == 32 {
-        let b = slice_from_raw(vk_ptr, vk_len);
+        let b = match slice_from_raw_bounded(vk_ptr, vk_len, 32) {
+            Ok(v) => v,
+            Err(e) => return set_err(e),
+        };
         [
             u64::from_le_bytes(b[0..8].try_into().unwrap()),
             u64::from_le_bytes(b[8..16].try_into().unwrap()),
@@ -167,7 +240,9 @@ pub unsafe extern "C" fn wasm_verify_light_cert(
     let out = WasmColdOutput {
         profile: format!("{:?}", res.profile),
         backend: format!("{:?}", res.backend),
+        verified_proof: res.verified_proof.to_string(),
         dual_openvm_present: res.dual_openvm_half_present,
+        openvm_half_verified: res.openvm_half_verified,
         query_height: res.tail.query_height,
         tip_height: res.tail.tip_height,
         query_id: hex::encode(res.tail.query_header_id),
@@ -184,21 +259,31 @@ pub unsafe extern "C" fn wasm_verify_light_cert(
     }
 }
 
-/// Extend a JSON `LightCheckpoint` with plain raw/gzip Ergo headers (zero STARK).
+/// Extend a JSON `LightCheckpoint` with plain raw/gzip Ergo headers (zero STARK),
+/// enforcing strict `V2Production128` profile admission and optional future timestamp drift
+/// (`<= now_ms + 20 min` when `now_ms > 0`).
 #[no_mangle]
-pub unsafe extern "C" fn wasm_extend_tail(
+pub unsafe extern "C" fn wasm_extend_tail_at_time(
     ckpt_ptr: *const u8,
     ckpt_len: usize,
     ext_ptr: *const u8,
     ext_len: usize,
+    now_ms: i64,
 ) -> i32 {
-    let ckpt_bytes = slice_from_raw(ckpt_ptr, ckpt_len);
-    let ext_bytes = slice_from_raw(ext_ptr, ext_len);
+    let ckpt_bytes = match slice_from_raw_bounded(ckpt_ptr, ckpt_len, MAX_JSON_INPUT_BYTES) {
+        Ok(b) => b,
+        Err(e) => return set_err(e),
+    };
+    let ext_bytes = match slice_from_raw_bounded(ext_ptr, ext_len, MAX_EXTENSION_RAW_BYTES) {
+        Ok(b) => b,
+        Err(e) => return set_err(e),
+    };
     let ckpt: LightCheckpoint = match serde_json::from_slice(ckpt_bytes) {
         Ok(c) => c,
         Err(e) => return set_err(format!("checkpoint json: {e}")),
     };
-    let (next, hdrs) = match extend_light_checkpoint_bytes(&ckpt, ext_bytes) {
+    let clock = if now_ms > 0 { Some(now_ms) } else { None };
+    let (next, hdrs) = match extend_light_checkpoint_bytes_at_time(&ckpt, ext_bytes, clock) {
         Ok(v) => v,
         Err(e) => return set_err(e.to_string()),
     };
@@ -223,9 +308,21 @@ pub unsafe extern "C" fn wasm_extend_tail(
     }
 }
 
-/// End-to-end live post-STARK state proof verification inside WASM:
-/// extends `LightCheckpoint` with plain headers, locates certified `prev_height` & `height`,
-/// verifies real Ergo AVL+ `ADProofs` UTXO state transition and Scorex Tx Merkle proof.
+/// Extend a JSON `LightCheckpoint` with plain raw/gzip Ergo headers (zero STARK, no wall-clock check).
+/// Still enforces strict `V2Production128` profile admission fail-closed.
+#[no_mangle]
+pub unsafe extern "C" fn wasm_extend_tail(
+    ckpt_ptr: *const u8,
+    ckpt_len: usize,
+    ext_ptr: *const u8,
+    ext_len: usize,
+) -> i32 {
+    wasm_extend_tail_at_time(ckpt_ptr, ckpt_len, ext_ptr, ext_len, 0)
+}
+
+/// End-to-end post-STARK state proof verification inside WASM:
+/// extends `V2Production128` `LightCheckpoint` with plain headers, locates `prev_height` & `height`,
+/// verifies real Ergo AVL+ `ADProofs` state transition and Scorex Tx Merkle proof.
 #[no_mangle]
 pub unsafe extern "C" fn wasm_verify_live_state_proof(
     ckpt_ptr: *const u8,
@@ -235,9 +332,18 @@ pub unsafe extern "C" fn wasm_verify_live_state_proof(
     fix_ptr: *const u8,
     fix_len: usize,
 ) -> i32 {
-    let ckpt_bytes = slice_from_raw(ckpt_ptr, ckpt_len);
-    let ext_bytes = slice_from_raw(ext_ptr, ext_len);
-    let fix_bytes = slice_from_raw(fix_ptr, fix_len);
+    let ckpt_bytes = match slice_from_raw_bounded(ckpt_ptr, ckpt_len, MAX_JSON_INPUT_BYTES) {
+        Ok(b) => b,
+        Err(e) => return set_err(e),
+    };
+    let ext_bytes = match slice_from_raw_bounded(ext_ptr, ext_len, MAX_EXTENSION_RAW_BYTES) {
+        Ok(b) => b,
+        Err(e) => return set_err(e),
+    };
+    let fix_bytes = match slice_from_raw_bounded(fix_ptr, fix_len, MAX_JSON_INPUT_BYTES) {
+        Ok(b) => b,
+        Err(e) => return set_err(e),
+    };
 
     let ckpt: LightCheckpoint = match serde_json::from_slice(ckpt_bytes) {
         Ok(c) => c,
@@ -247,7 +353,7 @@ pub unsafe extern "C" fn wasm_verify_live_state_proof(
         Ok(f) => f,
         Err(e) => return set_err(format!("fixture json: {e}")),
     };
-    let (next, hdrs) = match extend_light_checkpoint_bytes(&ckpt, ext_bytes) {
+    let (next, hdrs) = match extend_light_checkpoint_bytes_at_time(&ckpt, ext_bytes, None) {
         Ok(v) => v,
         Err(e) => return set_err(e.to_string()),
     };
@@ -265,6 +371,13 @@ pub unsafe extern "C" fn wasm_verify_live_state_proof(
         Ok(b) => b,
         Err(e) => return set_err(format!("ad_proofs_hex: {e}")),
     };
+    let mut lookups = Vec::with_capacity(fix.lookup_box_ids.len());
+    for s in &fix.lookup_box_ids {
+        match hex32(s) {
+            Ok(id) => lookups.push(id),
+            Err(e) => return set_err(e),
+        }
+    }
     let mut spent = Vec::with_capacity(fix.spent_box_ids.len());
     for s in &fix.spent_box_ids {
         match hex32(s) {
@@ -285,10 +398,11 @@ pub unsafe extern "C" fn wasm_verify_live_state_proof(
         created.push((id, raw));
     }
 
-    let new_root = match verify_block_ad_proofs(prev_hdr, curr_hdr, &ad_bytes, &spent, &created) {
-        Ok(r) => r,
-        Err(e) => return set_err(e.to_string()),
-    };
+    let new_root =
+        match verify_block_ad_proofs_with_lookups(prev_hdr, curr_hdr, &ad_bytes, &lookups, &spent, &created) {
+            Ok(r) => r,
+            Err(e) => return set_err(e.to_string()),
+        };
 
     let leaf_data = match hex32(&fix.merkle_tx_proof.leaf_data) {
         Ok(v) => v,
@@ -312,9 +426,11 @@ pub unsafe extern "C" fn wasm_verify_live_state_proof(
         prev_state_root: hex::encode(prev_hdr.state_root),
         next_state_root: hex::encode(new_root),
         ad_bytes: ad_bytes.len(),
+        lookup_count: lookups.len(),
         spent_count: spent.len(),
         created_count: created.len(),
         tx_merkle_verified: true,
+        verified_tx_id: hex::encode(leaf_data),
     };
     match serde_json::to_vec(&out) {
         Ok(v) => {
@@ -325,36 +441,12 @@ pub unsafe extern "C" fn wasm_verify_live_state_proof(
     }
 }
 
-#[derive(serde::Deserialize)]
-struct WasmCheckpointBlockInput {
-    ad_proofs_hex: String,
-    #[serde(default)]
-    lookup_box_ids: Vec<String>,
-    spent_box_ids: Vec<String>,
-    created_boxes: Vec<WasmCreatedBox>,
-    merkle_tx_proof: Option<WasmMerkleProof>,
-}
-
-#[derive(serde::Serialize)]
-struct WasmCheckpointBlockOutput {
-    height: u32,
-    block_id: String,
-    tip_height: u32,
-    header_chain_len: usize,
-    prev_state_root: String,
-    next_state_root: String,
-    ad_bytes: usize,
-    lookup_count: usize,
-    spent_count: usize,
-    created_count: usize,
-    tx_merkle_verified: bool,
-}
-
-/// Verify ANY certified block `H <= checkpoint.tip_height` directly against a verified
-/// `V2Production128` `LightCheckpoint` inside WASM, using a descending raw header chain
-/// `[tip_height, ..., H, H - 1]` authenticated by BLAKE2b-256 back from `checkpoint.tip_id`,
-/// full multi-tx `ADProofs` (including `dataInputs` lookups + intra-block cancellation),
-/// and optional Scorex transaction Merkle inclusion proof.
+/// Verify a block `H <= checkpoint.tip_height` directly against a verified `V2Production128`
+/// `LightCheckpoint` inside WASM, enforcing:
+/// - descending raw header chain `[tip_height, ..., H, H - 1]` authenticated by `BLAKE2b-256`,
+/// - `confirmations >= min_confirmations` (defaults to `k_0 = 64` unless explicitly overridden),
+/// - `ADProofs` AVL+ state transition (`toLookup ++ toRemove ++ toAppend`, requiring `Some(_)` on lookups),
+/// - strict `expected_tx_id == leafData` binding when `expected_tx_id` is supplied.
 #[no_mangle]
 pub unsafe extern "C" fn wasm_verify_checkpoint_block_state(
     ckpt_ptr: *const u8,
@@ -364,9 +456,18 @@ pub unsafe extern "C" fn wasm_verify_checkpoint_block_state(
     block_json_ptr: *const u8,
     block_json_len: usize,
 ) -> i32 {
-    let ckpt_bytes = slice_from_raw(ckpt_ptr, ckpt_len);
-    let chain_bytes = slice_from_raw(chain_ptr, chain_len);
-    let block_bytes = slice_from_raw(block_json_ptr, block_json_len);
+    let ckpt_bytes = match slice_from_raw_bounded(ckpt_ptr, ckpt_len, MAX_JSON_INPUT_BYTES) {
+        Ok(b) => b,
+        Err(e) => return set_err(e),
+    };
+    let chain_bytes = match slice_from_raw_bounded(chain_ptr, chain_len, MAX_EXTENSION_RAW_BYTES) {
+        Ok(b) => b,
+        Err(e) => return set_err(e),
+    };
+    let block_bytes = match slice_from_raw_bounded(block_json_ptr, block_json_len, MAX_JSON_INPUT_BYTES) {
+        Ok(b) => b,
+        Err(e) => return set_err(e),
+    };
 
     let ckpt: LightCheckpoint = match serde_json::from_slice(ckpt_bytes) {
         Ok(c) => c,
@@ -423,6 +524,14 @@ pub unsafe extern "C" fn wasm_verify_checkpoint_block_state(
         }
         None => None,
     };
+    let expected_tx_id = match inp.expected_tx_id {
+        Some(ref s) if !s.is_empty() => match hex32(s) {
+            Ok(id) => Some(id),
+            Err(e) => return set_err(format!("expected_tx_id: {e}")),
+        },
+        _ => None,
+    };
+    let min_confirmations = inp.min_confirmations.unwrap_or(PROD128_MIN_CONFIRMATIONS);
 
     let res = match verify_checkpoint_block_state(
         &ckpt,
@@ -432,6 +541,8 @@ pub unsafe extern "C" fn wasm_verify_checkpoint_block_state(
         &spent,
         &created,
         tx_proof.as_ref(),
+        expected_tx_id,
+        min_confirmations,
     ) {
         Ok(v) => v,
         Err(e) => return set_err(e.to_string()),
@@ -441,6 +552,8 @@ pub unsafe extern "C" fn wasm_verify_checkpoint_block_state(
         height: res.height,
         block_id: hex::encode(res.block_id),
         tip_height: ckpt.tip_height,
+        confirmations: res.confirmations,
+        confirmed_k0: res.confirmed_k0,
         header_chain_len: res.header_chain_len,
         prev_state_root: hex::encode(res.prev_state_root),
         next_state_root: hex::encode(res.next_state_root),
@@ -449,6 +562,7 @@ pub unsafe extern "C" fn wasm_verify_checkpoint_block_state(
         spent_count: res.spent_count,
         created_count: res.created_count,
         tx_merkle_verified: res.tx_merkle_verified,
+        verified_tx_id: res.verified_tx_id.map(hex::encode),
     };
     match serde_json::to_vec(&out) {
         Ok(v) => {

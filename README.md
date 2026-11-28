@@ -1,8 +1,8 @@
 # Ergo NiPoPoW V2
 
-**Strict 128-Bit Incremental Post-Quantum Certification of Ergo Header History**
+**128-Bit Analytical Sampling & Incremental Transparent STARK Certification of Ergo Header History**
 
-A. Shannon · 27 November 2026 · MIT OR Apache-2.0
+A. Shannon · 28 November 2026 · MIT OR Apache-2.0
 
 [![CI](https://github.com/a-shannon/ergo-nipopow-v2/actions/workflows/ci.yml/badge.svg)](https://github.com/a-shannon/ergo-nipopow-v2/actions/workflows/ci.yml)
 [![Live Browser WASM Demo](https://img.shields.io/badge/Live%20Demo-Browser%20WASM%20Light%20Client-ff5e18)](https://a-shannon.github.io/ergo-nipopow-v2/)
@@ -11,14 +11,25 @@ A. Shannon · 27 November 2026 · MIT OR Apache-2.0
 
 ## Overview
 
-**Ergo NiPoPoW V2** certifies Ergo's complete canonical header history from genesis (`1..=1,827,840`) at **strict 128-bit end-to-end post-quantum security** (`V2Production128`) with **zero hard fork, zero soft fork, zero miner change, zero trusted setup, and zero elliptic-curve pairing assumptions**.
+**Ergo NiPoPoW V2** certifies Ergo's complete canonical header history from genesis (`1..=1,827,840`) using `V2Production128` (**128-bit analytical protocol sampling/race error `<= 2^-128.35 < 2^-128`** via exact rational certification, reported separately from ZisK STARK soundness `~2^-128` JBR, 256-bit hash collision assumptions [`128-bit` classical / `~2^85` generic quantum collision], and Ergo's common-prefix premise `ε_CP`) with **zero hard fork, zero soft fork, zero miner change, zero trusted setup, and zero elliptic-curve pairing assumptions**.
 
-All **1,827,840 canonical Ergo mainnet headers** (tip `20ed709e5e9ba0d40fa941b2de53a3cdbd5bf29950b4a40adad8d244209ff9b3`, `407.07 MiB` raw headers) have been proved end-to-end into a **100% Path-Independent Reproducible Heterogeneous Dual-Proof `V2Certificate`** pairing two completely independent transparent post-quantum zkVMs over the **exact byte-identical `BootstrapStatement`** (`SHA-256 = e7981fbc64af4abdd38292792584f1d9850ee6fb293f12c27f2dead07a55edbc`):
+All **1,827,840 canonical Ergo mainnet headers** (tip `20ed709e5e9ba0d40fa941b2de53a3cdbd5bf29950b4a40adad8d244209ff9b3`, `407.07 MiB` raw headers) have been proved end-to-end into a **100% Path-Independent Reproducible Heterogeneous Dual-Proof `V2Certificate`** pairing two completely independent transparent hash-based zkVMs over the **exact byte-identical `BootstrapStatement`** (`SHA-256 = e7981fbc64af4abdd38292792584f1d9850ee6fb293f12c27f2dead07a55edbc`):
 
 - **Proof A — ZisK `v1.4.0-alpha`** (`RV64IMA`, `Goldilocks^3`, 256-bit `BLAKE3`, DEEP-ALI + **STIR `--minimal`**): **`245.96 KiB` (`251,864 B`)**, verified on pure CPU in **`2 ms`**. Full 7-year genesis-to-STIR run completed in **`27 min 03 s`** on `2× RTX 5090`. All 3 recursive guest ROM roots (`leaf-segment`, `agg-l1`, `agg-root`) reproduce bit-for-bit from source via `scripts/verify_reproducible_vks.sh` and `docker/reproducible-zisk-vks.Dockerfile`.
-- **Proof B — OpenVM `v2.1.0`** (`RV32IM`, `BabyBear^4`, `Poseidon2`, **SWIRL/WHIR**, zkSecurity audited & Lean-verified, **100-bit proven RBR security** via OpenVM `v2.1.0` default `*_with_100_bits_security` parameters as independent defense-in-depth alongside 128-bit ZisK): **`533.5 KiB` (`546,289 B`)**. All 3 recursive guest ELFs (`leaf-segment`, `agg-l1`, `agg-root`) are compiled with `--remap-path-prefix` (zero host paths; `leaf-segment` `.vmexe` reproduces bit-for-bit across directories). Incremental depth-2 renewal (`L1 delta + Root`) completes in **`23.25 s`** on a single RTX 4090 by reusing 99.5% of frozen history.
+- **Proof B — OpenVM `v2.1.0`** (`RV32IM`, `BabyBear^4`, `Poseidon2`, **SWIRL/WHIR**, zkSecurity audited & partially Lean-verified [RV32IM/memory/SHA-2 circuits], **100-bit proven RBR security** via OpenVM `v2.1.0` default `*_with_100_bits_security` parameters as independent defense-in-depth alongside 128-bit ZisK): **`533.5 KiB` (`546,289 B`)**. Full verification of BOTH halves runs in `host-aggregator verify-cert`; the lightweight `wasm32` verifier (`ergo-nipopow-v2-light`) verifies the ZisK STIR half only and explicitly reports `openvm_half_verified = false`.
 
-### What's New in `v0.4.2` (Live Multi-Tx Any-Block `ADProofs`, GitHub Pages Live Demo & `@ergo-nipopow-v2/light-wasm` SDK)
+### What's New in `v0.4.3` (Multi-Model Security & Consensus Hardening — Zero VK Changes)
+
+Following three independent read-only audits across the cryptography, WASM/JS light client, red-team DoS surface, and EIP-0054 specification (zero critical bugs in the core proof machinery; `crates/ergo-nipopow-v2-core/src/` untouched so all `v0.4.0` reproducible VKs remain 100% identical):
+
+- **Strict `V2Production128` Profile Admission on ALL Extension Paths:** Enforced fail-closed in `extend_light_checkpoint_bytes`, `extend_light_checkpoint_bytes_at_time`, `wasm_extend_tail`, `wasm_verify_live_state_proof`, and browser `localStorage` resume.
+- **Confirmation Depth (`k_0 = 64`) & Ergo +20 min Clock Drift Guard:** `verify_checkpoint_block_state` enforces `>= 64` confirmations by default (returning `confirmations` & `confirmed_k0`; unconfirmed recent blocks require explicit opt-in), and `extend_light_checkpoint_bytes_at_time` rejects future header timestamps exceeding `now + 20 min`.
+- **Strict Requested-`txId` Merkle Binding & `dataInputs` Existence:** `verify_checkpoint_block_state` now binds `merkle_tx_proof.leafData == expected_tx_id`, returns `verified_tx_id` directly from WASM, and rejects `Ok(None)` (proof of non-existence) on `Operation::Lookup` for claimed external `dataInputs`.
+- **Enforced Anti-DoS Bounds & Pinned VKs:** Enforced EIP-0054 compressed/decompressed caps (`12/16/8 MiB`, `take(cap + 1)`), bounded `bincode` with `reject_trailing_bytes()`, `1..=514 B` per-header frames with checked arithmetic, `wasm_alloc` caps + `try/finally` cleanup, compile-time pinned `v0.4.0` ZisK & OpenVM VKs in `host-aggregator verify-cert` (`--unsafe-override-vk` required to override), and chain-commitment (`query_header_id`) equal-work tie-breaking in `compare_peer_certificates`.
+- **Lossless 64-Bit Ergo `Long` JSON & Reorg-Safe Block Fetching (`web/`, `packages/light-wasm/`):** `parseJsonLosslessInts` preserves `> 2^53 - 1` box values/token amounts before `BigInt` conversion; `fetchLiveBlockProofBundle` fetches `/blocks/{certifiedBlockId}` directly from the header chain instead of `/blocks/at/{H}`; `fetchLiveHeadersU32le` enforces strict contiguous pagination and timeouts.
+- **Honest Dual vs Light Reporting:** `ergo-nipopow-v2-light` and WASM now explicitly report `verified_proof: "ZiskStirV14_only (OpenVM half unverified in light verifier)"` and `openvm_half_verified: false` when inspecting a Dual container.
+
+### Highlights from `v0.4.2` (Live Multi-Tx Any-Block `ADProofs`, GitHub Pages Live Demo & `@ergo-nipopow-v2/light-wasm` SDK)
 
 - **Live Any-Block Multi-Tx `ADProofs` & Tx Merkle in Browser WASM ([Try Live Demo](https://a-shannon.github.io/ergo-nipopow-v2/)):** Added `verify_block_ad_proofs_with_lookups` and `verify_checkpoint_block_state` (`wasm_verify_checkpoint_block_state`), matching Ergo reference node `ErgoState.stateChanges` / `StateChanges.operations` (`toLookup ++ toRemove ++ toAppend`, supporting `dataInputs` lookups and intra-block spend cancellation). Verified live in V8 against `https://node.ergo.watch` on multi-tx mainnet blocks (`1,828,096` with 4 txs / 2 intra-block spends / `10.5 KiB` `ADProofs` in **`1.9 ms`**; `1,828,095` with `dataInputs` lookup / `38.7 KiB` `ADProofs` in **`1.4 ms`**).
 - **Zero-Dependency TypeScript/ESM Wallet Package (`packages/light-wasm/`):** Ready-to-consume `@ergo-nipopow-v2/light-wasm` package (`package.json`, `index.js`, `index.d.ts`, `README.md`) with zero runtime npm dependencies and canonical `ErgoHeader` + `ErgoBox` binary encoders.

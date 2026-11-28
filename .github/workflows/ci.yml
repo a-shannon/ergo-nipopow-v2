@@ -46,17 +46,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if ! gh release view v0.4.0 -R "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "INFO: Release v0.4.0 not published yet; skipping live v0.4.0 release asset check."
-            exit 0
-          fi
           mkdir -p release-assets work-light
-          gh release download v0.4.0 -R "${{ github.repository }}" -D release-assets \
+          gh release download v0.4.0 -R "a-shannon/ergo-nipopow-v2" -D release-assets \
             -p "ergo-mainnet-1827840-prod128-dual.npv2.bin" \
             -p "ergo-mainnet-1827840-prod128-zisk-stir.npv2.bin" \
             -p "tail-1819645-1827840.u32le" \
             -p "SHA256SUMS.txt"
-          (cd release-assets && sha256sum --ignore-missing -c SHA256SUMS.txt)
+          (cd release-assets && grep -E '  (ergo-mainnet-1827840-prod128-dual\.npv2\.bin|ergo-mainnet-1827840-prod128-zisk-stir\.npv2\.bin|tail-1819645-1827840\.u32le)$' SHA256SUMS.txt | sha256sum -c -)
 
           LIGHT=target/release/ergo-nipopow-v2-light
 
@@ -130,16 +126,24 @@ jobs:
             console.log("WEB_SDK_CI_PASS: profile=" + verified.profile + " tip=" + verified.tip_height + " -> " + extended.tip_height);
           '
 
-          echo "=== Verify npm package (@ergo-nipopow-v2/light-wasm) parity & dry-run pack ==="
+          echo "=== Verify npm package (@ergo-nipopow-v2/light-wasm) parity, lossless Long JSON & dry-run pack ==="
           cmp -s web/nipopow-v2.js packages/light-wasm/index.js
           (cd packages/light-wasm && npm pack --dry-run)
           node --input-type=module -e '
             import fs from "node:fs";
-            import { NiPoPoWV2Wasm } from "./packages/light-wasm/index.js";
+            import { NiPoPoWV2Wasm, parseJsonLosslessInts, encodeVlqUint } from "./packages/light-wasm/index.js";
+            const parsed = parseJsonLosslessInts("{\"value\":9007199254740993,\"small\":42}");
+            if (parsed.value !== "9007199254740993" || parsed.small !== 42) {
+              throw new Error("lossless Long JSON failed: " + JSON.stringify(parsed));
+            }
+            encodeVlqUint(parsed.value);
             const wasm = fs.readFileSync("target/wasm32-unknown-unknown/release/ergo_nipopow_v2_light.wasm");
+            const cert = fs.readFileSync("work-light/stir.npv2.bin.gz");
+            const tail = fs.readFileSync("work-light/tail.u32le.gz");
             const client = await NiPoPoWV2Wasm.load(wasm);
-            if (typeof client.verifyCheckpointBlockState !== "function") {
-              throw new Error("missing verifyCheckpointBlockState export");
+            const v = client.verifyCert(cert, tail);
+            if (v.profile !== "V2Production128" || v.openvm_half_verified !== false) {
+              throw new Error("unexpected npm verifyCert: " + JSON.stringify(v));
             }
             console.log("NPM_LIGHT_WASM_PACKAGE_CI_PASS");
           '
@@ -174,19 +178,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if ! gh release view v0.4.0 -R "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "INFO: Release v0.4.0 not published yet; skipping live v0.4.0 release asset cold-verify."
-            exit 0
-          fi
           mkdir -p release-assets
-          gh release download v0.4.0 -R "${{ github.repository }}" -D release-assets \
+          gh release download v0.4.0 -R "a-shannon/ergo-nipopow-v2" -D release-assets \
             -p "ergo-mainnet-1827840-prod128-dual.npv2.bin" \
             -p "ergo-mainnet-1827840-prod128-zisk-stir.npv2.bin" \
             -p "tail-1819645-1827840.u32le" \
             -p "root-agg.vk" \
             -p "root-baseline.json" \
             -p "SHA256SUMS.txt"
-          (cd release-assets && sha256sum --ignore-missing -c SHA256SUMS.txt)
+          (cd release-assets && grep -E '  (ergo-mainnet-1827840-prod128-dual\.npv2\.bin|ergo-mainnet-1827840-prod128-zisk-stir\.npv2\.bin|tail-1819645-1827840\.u32le|root-agg\.vk|root-baseline\.json)$' SHA256SUMS.txt | sha256sum -c -)
 
           AGG=host-aggregator/target/release/ergo-nipopow-v2-aggregator
           ZISK_VK="11772000642296811191,2917608110684279903,7269122849900466967,12697094355253129467"

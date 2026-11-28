@@ -35,7 +35,7 @@ fn read_u32le_headers(path: &str) -> Vec<Vec<u8>> {
 }
 
 #[test]
-#[ignore = "needs the v0.2.0 release assets: NPV2_CERT_BIN and NPV2_TAIL_U32LE"]
+#[ignore = "needs the v0.4.0 release assets: NPV2_CERT_BIN and NPV2_TAIL_U32LE"]
 fn exact_tail_must_end_at_the_statement_tip() {
     let cert_path = env_path("NPV2_CERT_BIN");
     let cert_bytes = std::fs::read(&cert_path).unwrap_or_else(|e| panic!("read {cert_path}: {e}"));

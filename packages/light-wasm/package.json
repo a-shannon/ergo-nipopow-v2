@@ -1,7 +1,7 @@
 {
   "name": "@ergo-nipopow-v2/light-wasm",
-  "version": "0.4.2",
-  "description": "Zero-dependency strict 128-bit Ergo NiPoPoW V2 WebAssembly light-client verifier, live plain-header sync, and trustless AVL+ ADProofs / Tx Merkle checker for browsers and Node.js.",
+  "version": "0.4.3",
+  "description": "Zero-dependency V2Production128 Ergo NiPoPoW V2 WebAssembly light-client verifier (ZisK STIR half), live plain-header sync, and trustless AVL+ ADProofs / Tx Merkle checker for browsers and Node.js.",
   "type": "module",
   "main": "./index.js",
   "module": "./index.js",
@@ -15,8 +15,7 @@
   "files": [
     "index.js",
     "index.d.ts",
-    "README.md",
-    "ergo_nipopow_v2_light.wasm"
+    "README.md"
   ],
   "keywords": [
     "ergo",
@@ -25,7 +24,6 @@
     "wasm",
     "webassembly",
     "stark",
-    "post-quantum",
     "avl-tree",
     "adproofs",
     "utxo"

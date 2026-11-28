@@ -8,6 +8,7 @@
 
 use std::io::Read;
 
+use bincode::Options;
 use bytes::Bytes;
 use ergo_avltree_rust::authenticated_tree_ops::AuthenticatedTreeOps;
 use ergo_avltree_rust::batch_avl_verifier::BatchAVLVerifier;
@@ -38,6 +39,22 @@ pub const PINNED_ZISK_ROOT_VK_PROD128: [u64; 4] = [
     7269122849900466967,
     12697094355253129467,
 ];
+
+/// Hard EIP-0054 anti-DoS payload caps enforced fail-closed before allocating/deserializing.
+pub const MAX_CERT_COMPRESSED_BYTES: usize = 12 * 1024 * 1024;
+pub const MAX_CERT_RAW_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_TAIL_COMPRESSED_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_TAIL_RAW_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_EXTENSION_COMPRESSED_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_EXTENSION_RAW_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_HEADER_BYTES: usize = 514;
+pub const MAX_HEADER_CHAIN_LEN: usize = 2048;
+pub const MAX_AD_PROOFS_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_JSON_INPUT_BYTES: usize = 8 * 1024 * 1024;
+/// Ergo maximum allowed future header timestamp drift (+20 minutes).
+pub const MAX_FUTURE_DRIFT_MS: i64 = 20 * 60 * 1000;
+/// `V2Production128` common-prefix confirmation depth (`k_0 = 64`).
+pub const PROD128_MIN_CONFIRMATIONS: u32 = 64;
 
 #[derive(Debug)]
 pub enum LightError {
@@ -76,37 +93,97 @@ impl std::fmt::Display for LightError {
 
 impl std::error::Error for LightError {}
 
-/// Transparently decompress gzip-framed payloads (`0x1f 0x8b`) or return raw bytes unchanged.
-pub fn decompress_if_gzip(bytes: &[u8]) -> Result<Vec<u8>, LightError> {
+/// Bounded gzip decompression (defends against gzip bombs / unbounded memory growth).
+pub fn decompress_if_gzip_bounded(
+    bytes: &[u8],
+    max_compressed: usize,
+    max_decompressed: usize,
+) -> Result<Vec<u8>, LightError> {
+    if bytes.len() > max_compressed {
+        return Err(LightError::Decompress(format!(
+            "compressed payload {} B exceeds cap {} B",
+            bytes.len(),
+            max_compressed
+        )));
+    }
     if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
-        let mut dec = GzDecoder::new(bytes);
+        let mut dec = GzDecoder::new(bytes).take((max_decompressed as u64).saturating_add(1));
         let mut out = Vec::new();
         dec.read_to_end(&mut out)
             .map_err(|e| LightError::Decompress(e.to_string()))?;
+        if out.len() > max_decompressed {
+            return Err(LightError::Decompress(format!(
+                "decompressed payload exceeds cap {} B",
+                max_decompressed
+            )));
+        }
         Ok(out)
     } else {
+        if bytes.len() > max_decompressed {
+            return Err(LightError::Decompress(format!(
+                "raw payload {} B exceeds cap {} B",
+                bytes.len(),
+                max_decompressed
+            )));
+        }
         Ok(bytes.to_vec())
     }
 }
 
-/// Decode a length-prefixed `.u32le` header stream (raw or gzip-compressed).
-pub fn decode_u32le_headers(bytes: &[u8]) -> Result<Vec<Vec<u8>>, LightError> {
-    let raw = decompress_if_gzip(bytes)?;
+/// Transparently decompress gzip-framed payloads (`0x1f 0x8b`) under the default extension cap.
+pub fn decompress_if_gzip(bytes: &[u8]) -> Result<Vec<u8>, LightError> {
+    decompress_if_gzip_bounded(bytes, MAX_EXTENSION_COMPRESSED_BYTES, MAX_EXTENSION_RAW_BYTES)
+}
+
+/// Bounded decode of a length-prefixed `.u32le` header stream (raw or gzip-compressed),
+/// enforcing `1..=514` bytes per Ergo header, checked index arithmetic, and max header count.
+pub fn decode_u32le_headers_bounded(
+    bytes: &[u8],
+    max_compressed: usize,
+    max_decompressed: usize,
+    max_headers: usize,
+) -> Result<Vec<Vec<u8>>, LightError> {
+    let raw = decompress_if_gzip_bounded(bytes, max_compressed, max_decompressed)?;
     let mut headers = Vec::new();
     let mut pos = 0usize;
     while pos < raw.len() {
-        if pos + 4 > raw.len() {
+        if headers.len() >= max_headers {
+            return Err(LightError::Decode(format!(
+                "header count exceeds cap {max_headers}"
+            )));
+        }
+        let len_end = pos
+            .checked_add(4)
+            .ok_or_else(|| LightError::Decode("u32le header offset overflow".into()))?;
+        if len_end > raw.len() {
             return Err(LightError::Decode("truncated u32le header length".into()));
         }
-        let len = u32::from_le_bytes(raw[pos..pos + 4].try_into().unwrap()) as usize;
-        pos += 4;
-        if pos + len > raw.len() {
+        let len = u32::from_le_bytes(raw[pos..len_end].try_into().unwrap()) as usize;
+        if len == 0 || len > MAX_HEADER_BYTES {
+            return Err(LightError::Decode(format!(
+                "invalid Ergo header length {len} (expected 1..={MAX_HEADER_BYTES})"
+            )));
+        }
+        let payload_end = len_end
+            .checked_add(len)
+            .ok_or_else(|| LightError::Decode("u32le payload offset overflow".into()))?;
+        if payload_end > raw.len() {
             return Err(LightError::Decode("truncated u32le header payload".into()));
         }
-        headers.push(raw[pos..pos + len].to_vec());
-        pos += len;
+        headers.push(raw[len_end..payload_end].to_vec());
+        pos = payload_end;
     }
     Ok(headers)
+}
+
+/// Decode a length-prefixed `.u32le` header stream (raw or gzip-compressed) under default extension bounds.
+pub fn decode_u32le_headers(bytes: &[u8]) -> Result<Vec<Vec<u8>>, LightError> {
+    decode_u32le_headers_bounded(
+        bytes,
+        MAX_EXTENSION_COMPRESSED_BYTES,
+        MAX_EXTENSION_RAW_BYTES,
+        200_000,
+    )
 }
 
 /// Parse a 4-limb comma-separated ZisK ROM root string.
@@ -179,11 +256,18 @@ pub fn verify_zisk_root_proof_bytes(
 }
 
 /// Complete light-client verification output.
+///
+/// NOTE: `ergo-nipopow-v2-light` verifies ONLY the 128-bit ZisK STIR structural proof
+/// (zero OpenVM prover SDK). When inspecting a `DualZiskV14OpenVmV21` container,
+/// `dual_openvm_half_present` is `true` while `openvm_half_verified` is always `false`;
+/// verifying BOTH proofs requires `ergo-nipopow-v2-aggregator verify-cert`.
 #[derive(Clone, Debug)]
 pub struct VerifiedLightCertificate {
     pub profile: ProfileId,
     pub backend: StructuralBackend,
+    pub verified_proof: &'static str,
     pub dual_openvm_half_present: bool,
+    pub openvm_half_verified: bool,
     pub statement_sha256: [u8; 32],
     pub audit_draws: usize,
     pub tail: VerifiedTail,
@@ -191,15 +275,21 @@ pub struct VerifiedLightCertificate {
 
 /// Cold-verify a raw or gzip-compressed `V2Certificate` (`ZiskStirV14` or ZisK STIR half of
 /// `DualZiskV14OpenVmV21`) plus its exact modern tail using zero prover SDK and zero GPU.
-/// Enforces `cert.statement.profile == ProfileId::V2Production128` fail-closed.
+/// Enforces `cert.statement.profile == ProfileId::V2Production128`, EIP-0054 byte caps,
+/// and strict non-trailing bincode decoding fail-closed.
 pub fn verify_light_certificate(
     cert_bytes: &[u8],
     tail_u32le_bytes: &[u8],
     query_height: u32,
     expected_zisk_root_vk: &[u64; 4],
 ) -> Result<VerifiedLightCertificate, LightError> {
-    let cert_raw = decompress_if_gzip(cert_bytes)?;
-    let cert: V2Certificate = bincode::deserialize(&cert_raw)
+    let cert_raw =
+        decompress_if_gzip_bounded(cert_bytes, MAX_CERT_COMPRESSED_BYTES, MAX_CERT_RAW_BYTES)?;
+    let cert: V2Certificate = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(MAX_CERT_RAW_BYTES as u64)
+        .reject_trailing_bytes()
+        .deserialize(&cert_raw)
         .map_err(|e| LightError::Decode(format!("certificate bincode: {e}")))?;
     if cert.magic != CERT_MAGIC {
         return Err(LightError::InvalidMagic);
@@ -211,20 +301,23 @@ pub fn verify_light_certificate(
         .map_err(|e| LightError::Decode(format!("statement bincode: {e}")))?;
     let expected_pv = sha256_bytes(&x_bytes);
 
-    let dual_openvm_half_present = match cert.backend {
+    let (dual_openvm_half_present, verified_proof) = match cert.backend {
         StructuralBackend::ZiskStirV14 => {
             verify_zisk_root_proof_bytes(&cert.structural_proof, expected_zisk_root_vk, &expected_pv)?;
-            false
+            (false, "ZiskStirV14")
         }
         StructuralBackend::DualZiskV14OpenVmV21 => {
+            if cert.structural_proof.len() > MAX_CERT_RAW_BYTES {
+                return Err(LightError::Decode("dual structural proof exceeds cap".into()));
+            }
             let dual = DualStructuralProof::decode_canonical(&cert.structural_proof)
                 .map_err(|e| LightError::Decode(format!("DualStructuralProof: {e:?}")))?;
             verify_zisk_root_proof_bytes(&dual.zisk_proof, expected_zisk_root_vk, &expected_pv)?;
-            true
+            (true, "ZiskStirV14_only (OpenVM half unverified in light verifier)")
         }
         StructuralBackend::OpenVmSwirlV21 => {
             return Err(LightError::UnsupportedBackend(
-                "OpenVmSwirlV21 standalone requires host-aggregator; light verifier checks ZiskStirV14 and DualZiskV14OpenVmV21",
+                "OpenVmSwirlV21 standalone requires host-aggregator; light verifier checks ZiskStirV14 and the ZisK half of DualZiskV14OpenVmV21",
             ));
         }
     };
@@ -232,8 +325,18 @@ pub fn verify_light_certificate(
     let audit_draws = verify_audit_bundle(&cert.statement, &x_bytes, &cert.structural_proof, &cert.audit)
         .map_err(|e| LightError::Audit(format!("{e:?}")))?;
 
-    let raw_headers = decode_u32le_headers(tail_u32le_bytes)?;
-    let expected_tail_len = (cert.statement.tip_height - cert.statement.bootstrap_height) as usize;
+    let expected_tail_len = cert
+        .statement
+        .tip_height
+        .checked_sub(cert.statement.bootstrap_height)
+        .ok_or_else(|| LightError::Tail("tip_height < bootstrap_height".into()))?
+        as usize;
+    let raw_headers = decode_u32le_headers_bounded(
+        tail_u32le_bytes,
+        MAX_TAIL_COMPRESSED_BYTES,
+        MAX_TAIL_RAW_BYTES,
+        expected_tail_len.max(16_384),
+    )?;
     let tail_slice: &[Vec<u8>] = if raw_headers.len() == expected_tail_len {
         &raw_headers[..]
     } else if raw_headers.len() == cert.statement.tip_height as usize {
@@ -252,21 +355,58 @@ pub fn verify_light_certificate(
     Ok(VerifiedLightCertificate {
         profile: cert.statement.profile,
         backend: cert.backend,
+        verified_proof,
         dual_openvm_half_present,
+        openvm_half_verified: false,
         statement_sha256: expected_pv,
         audit_draws,
         tail,
     })
 }
 
-/// Extend a previously verified `LightCheckpoint` with plain raw Ergo headers only
-/// (~160 KiB/day, zero STARK download, zero prover dependency).
+/// Extend a previously verified `V2Production128` `LightCheckpoint` with plain raw Ergo headers
+/// (~160 KiB/day, zero STARK download). Enforces `V2Production128` profile admission, bounded
+/// decoding, and optional future-timestamp drift (`<= now_ms + 20 min`, Ergo consensus clock rule).
+///
+/// Note: Newly appended headers within `k_0 = 64` blocks of the resulting tip are unconfirmed;
+/// downstream block/state consumers MUST check confirmation depth before treating a block as final.
+pub fn extend_light_checkpoint_bytes_at_time(
+    checkpoint: &LightCheckpoint,
+    new_headers_u32le: &[u8],
+    now_ms: Option<i64>,
+) -> Result<(LightCheckpoint, Vec<CertifiedHeaderSummary>), LightError> {
+    if checkpoint.bootstrap.profile != ProfileId::V2Production128 {
+        return Err(LightError::UnsupportedProfile(checkpoint.bootstrap.profile));
+    }
+    let headers = decode_u32le_headers_bounded(
+        new_headers_u32le,
+        MAX_EXTENSION_COMPRESSED_BYTES,
+        MAX_EXTENSION_RAW_BYTES,
+        200_000,
+    )?;
+    let (next, appended) =
+        extend_checkpoint(checkpoint, &headers).map_err(|e| LightError::Tail(format!("{e:?}")))?;
+    if let Some(now) = now_ms {
+        let max_ts = now.saturating_add(MAX_FUTURE_DRIFT_MS);
+        for h in &appended {
+            if h.timestamp > max_ts {
+                return Err(LightError::Tail(format!(
+                    "header {} timestamp {} exceeds max allowed future drift {} (now {} + 20 min)",
+                    h.height, h.timestamp, max_ts, now
+                )));
+            }
+        }
+    }
+    Ok((next, appended))
+}
+
+/// Extend a previously verified `V2Production128` `LightCheckpoint` without a wall-clock check
+/// (for deterministic offline replay/tests; live callers should prefer `extend_light_checkpoint_bytes_at_time`).
 pub fn extend_light_checkpoint_bytes(
     checkpoint: &LightCheckpoint,
     new_headers_u32le: &[u8],
 ) -> Result<(LightCheckpoint, Vec<CertifiedHeaderSummary>), LightError> {
-    let headers = decode_u32le_headers(new_headers_u32le)?;
-    extend_checkpoint(checkpoint, &headers).map_err(|e| LightError::Tail(format!("{e:?}")))
+    extend_light_checkpoint_bytes_at_time(checkpoint, new_headers_u32le, None)
 }
 
 /// Verify an Ergo block's authentic AVL+ `ADProofs` state-root transition from
@@ -301,10 +441,19 @@ pub fn verify_block_ad_proofs_with_lookups(
     spent_box_ids: &[[u8; 32]],
     created_boxes: &[([u8; 32], Vec<u8>)],
 ) -> Result<[u8; 33], LightError> {
-    if curr_header.height != prev_header.height + 1 || curr_header.parent_id != prev_header.id {
+    if curr_header.height != prev_header.height.saturating_add(1)
+        || curr_header.parent_id != prev_header.id
+    {
         return Err(LightError::AvlProof(
             "curr_header is not direct child of prev_header".into(),
         ));
+    }
+    if ad_proofs_bytes.len() > MAX_AD_PROOFS_BYTES {
+        return Err(LightError::AvlProof(format!(
+            "adProofs {} B exceeds cap {} B",
+            ad_proofs_bytes.len(),
+            MAX_AD_PROOFS_BYTES
+        )));
     }
     let ad_root = blake2b256(ad_proofs_bytes);
     if ad_root != curr_header.ad_proofs_root {
@@ -327,7 +476,11 @@ pub fn verify_block_ad_proofs_with_lookups(
 
     let start_digest = Bytes::copy_from_slice(&prev_header.state_root);
     let proof_buf = Bytes::copy_from_slice(ad_proofs_bytes);
-    let total_ops = lookup_box_ids.len() + spent_box_ids.len() + created_boxes.len();
+    let total_ops = lookup_box_ids
+        .len()
+        .checked_add(spent_box_ids.len())
+        .and_then(|v| v.checked_add(created_boxes.len()))
+        .ok_or_else(|| LightError::AvlProof("operation count overflow".into()))?;
     fn verifier_resolver(digest: &[u8; 32]) -> ergo_avltree_rust::batch_node::Node {
         ergo_avltree_rust::batch_node::Node::LabelOnly(
             ergo_avltree_rust::batch_node::NodeHeader::new(Some(*digest), None),
@@ -344,9 +497,15 @@ pub fn verify_block_ad_proofs_with_lookups(
     .map_err(|e| LightError::AvlProof(format!("reconstruct_tree failed: {e}")))?;
 
     for data_input in lookup_box_ids {
-        verifier
+        let found = verifier
             .perform_one_operation(&Operation::Lookup(Bytes::copy_from_slice(data_input)))
             .map_err(|e| LightError::AvlProof(format!("AVL Lookup failed: {e}")))?;
+        if found.is_none() {
+            return Err(LightError::AvlProof(format!(
+                "AVL Lookup returned None (proof of non-existence) for claimed dataInput {}",
+                hex::encode(data_input)
+            )));
+        }
     }
     for spent in spent_box_ids {
         verifier
@@ -377,11 +536,18 @@ pub fn verify_block_ad_proofs_with_lookups(
     Ok(out)
 }
 
-/// Verified state & transaction inclusion result for any certified block `H <= checkpoint.tip_height`.
+/// Verified state-root transition & optional transaction Merkle inclusion result for a block
+/// `H <= checkpoint.tip_height`.
+///
+/// NOTE: Verifies the authenticated AVL+ UTXO state-root transition (`prev_state_root -> next_state_root`)
+/// and optional requested transaction Merkle inclusion (`verified_tx_id`); does NOT execute ErgoScript.
+/// Callers requiring finalized depth MUST enforce `confirmations >= PROD128_MIN_CONFIRMATIONS` (`64`).
 #[derive(Clone, Debug)]
 pub struct VerifiedCheckpointBlockState {
     pub height: u32,
     pub block_id: [u8; 32],
+    pub confirmations: u32,
+    pub confirmed_k0: bool,
     pub prev_state_root: [u8; 33],
     pub next_state_root: [u8; 33],
     pub header_chain_len: usize,
@@ -390,13 +556,20 @@ pub struct VerifiedCheckpointBlockState {
     pub spent_count: usize,
     pub created_count: usize,
     pub tx_merkle_verified: bool,
+    pub verified_tx_id: Option<[u8; 32]>,
 }
 
-/// Trustlessly verify ANY certified block `H <= checkpoint.tip_height` directly against
-/// a verified `V2Production128` `LightCheckpoint` using a descending raw Scorex header
-/// chain `[tip_height, tip_height - 1, ..., H, H - 1]` authenticated by BLAKE2b-256
-/// parent hashes back from `checkpoint.tip_id`, plus the block's `ADProofs` and optional
-/// Scorex transaction Merkle inclusion proof.
+/// Trustlessly verify a block's authenticated AVL+ state transition and optional requested
+/// transaction Merkle inclusion against a verified `V2Production128` `LightCheckpoint`,
+/// using a descending raw Scorex header chain `[tip_height, tip_height - 1, ..., H, H - 1]`
+/// bound via `BLAKE2b-256` parent hashes back from `checkpoint.tip_id`.
+///
+/// Enforces:
+/// - `checkpoint.bootstrap.profile == ProfileId::V2Production128`,
+/// - `confirmations = checkpoint.tip_height - H >= min_confirmations` (pass `PROD128_MIN_CONFIRMATIONS = 64`
+///   for strict confirmation depth; `0` only for explicit unconfirmed-tip inspection),
+/// - if `expected_tx_id` is `Some(txid)`, `tx_proof` MUST be present and `tx_proof.leaf_data == txid`.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_checkpoint_block_state(
     checkpoint: &LightCheckpoint,
     header_chain_desc_u32le: &[u8],
@@ -405,11 +578,18 @@ pub fn verify_checkpoint_block_state(
     spent_box_ids: &[[u8; 32]],
     created_boxes: &[([u8; 32], Vec<u8>)],
     tx_proof: Option<&ErgoTxMerkleProof>,
+    expected_tx_id: Option<[u8; 32]>,
+    min_confirmations: u32,
 ) -> Result<VerifiedCheckpointBlockState, LightError> {
     if checkpoint.bootstrap.profile != ProfileId::V2Production128 {
         return Err(LightError::UnsupportedProfile(checkpoint.bootstrap.profile));
     }
-    let raw_headers = decode_u32le_headers(header_chain_desc_u32le)?;
+    let raw_headers = decode_u32le_headers_bounded(
+        header_chain_desc_u32le,
+        MAX_TAIL_COMPRESSED_BYTES,
+        MAX_TAIL_RAW_BYTES,
+        MAX_HEADER_CHAIN_LEN,
+    )?;
     if raw_headers.len() < 2 {
         return Err(LightError::Tail(
             "header_chain_desc must contain at least 2 headers ([tip, tip-1])".into(),
@@ -435,7 +615,7 @@ pub fn verify_checkpoint_block_state(
             }
         } else {
             let child: &CertifiedHeaderSummary = &summaries[idx - 1];
-            if parsed.height + 1 != child.height {
+            if parsed.height.saturating_add(1) != child.height {
                 return Err(LightError::Tail(format!(
                     "header[{idx}] height {} does not precede child height {}",
                     parsed.height, child.height
@@ -448,6 +628,13 @@ pub fn verify_checkpoint_block_state(
     let n = summaries.len();
     let curr_hdr = &summaries[n - 2];
     let prev_hdr = &summaries[n - 1];
+    let confirmations = checkpoint.tip_height.saturating_sub(curr_hdr.height);
+    if confirmations < min_confirmations {
+        return Err(LightError::Tail(format!(
+            "block {} has only {} confirmations below tip {} (required >= {}; pass allow_unconfirmed only for unconfirmed inspection)",
+            curr_hdr.height, confirmations, checkpoint.tip_height, min_confirmations
+        )));
+    }
 
     let next_state_root = verify_block_ad_proofs_with_lookups(
         prev_hdr,
@@ -458,16 +645,36 @@ pub fn verify_checkpoint_block_state(
         created_boxes,
     )?;
 
-    let tx_merkle_verified = if let Some(proof) = tx_proof {
-        verify_tx_inclusion(curr_hdr, proof)?;
-        true
-    } else {
-        false
+    let (tx_merkle_verified, verified_tx_id) = match (tx_proof, expected_tx_id) {
+        (Some(proof), Some(exp)) => {
+            if proof.leaf_data != exp {
+                return Err(LightError::StateProof(format!(
+                    "merkle proof leafData {} does not match requested txId {}",
+                    hex::encode(proof.leaf_data),
+                    hex::encode(exp)
+                )));
+            }
+            verify_tx_inclusion(curr_hdr, proof)?;
+            (true, Some(proof.leaf_data))
+        }
+        (None, Some(exp)) => {
+            return Err(LightError::StateProof(format!(
+                "requested txId {} but no Merkle proof was supplied",
+                hex::encode(exp)
+            )));
+        }
+        (Some(proof), None) => {
+            verify_tx_inclusion(curr_hdr, proof)?;
+            (true, Some(proof.leaf_data))
+        }
+        (None, None) => (false, None),
     };
 
     Ok(VerifiedCheckpointBlockState {
         height: curr_hdr.height,
         block_id: curr_hdr.id,
+        confirmations,
+        confirmed_k0: confirmations >= PROD128_MIN_CONFIRMATIONS,
         prev_state_root: prev_hdr.state_root,
         next_state_root,
         header_chain_len: n,
@@ -476,6 +683,7 @@ pub fn verify_checkpoint_block_state(
         spent_count: spent_box_ids.len(),
         created_count: created_boxes.len(),
         tx_merkle_verified,
+        verified_tx_id,
     })
 }
 
@@ -502,21 +710,21 @@ pub struct PeerComparisonResult {
 
 /// Independently verify multiple untrusted peer `(label, cert_bytes, tail_bytes)` bundles,
 /// drop invalid/tampered peers fail-closed, and deterministically pick the heaviest valid
-/// `V2Production128` chain via `select_best` (tie-breaking by smallest canonical bytes).
+/// `V2Production128` chain via `select_best` (breaking equal-work ties on the immutable
+/// 32-byte `query_header_id` chain commitment rather than malleable proof container bytes).
 pub fn compare_peer_certificates(
     candidates: &[(&str, &[u8], &[u8])],
     query_height: u32,
     expected_zisk_root_vk: &[u64; 4],
 ) -> Result<PeerComparisonResult, LightError> {
-    let mut verified_items: Vec<(usize, String, VerifiedLightCertificate, Vec<u8>)> = Vec::new();
+    let mut verified_items: Vec<(usize, String, VerifiedLightCertificate)> = Vec::new();
     let mut rejected_peers: Vec<(String, String)> = Vec::new();
 
     for (idx, (label, cert_bytes, tail_bytes)) in candidates.iter().enumerate() {
         match verify_light_certificate(cert_bytes, tail_bytes, query_height, expected_zisk_root_vk)
         {
             Ok(v) => {
-                let raw = decompress_if_gzip(cert_bytes)?;
-                verified_items.push((idx, (*label).to_string(), v, raw));
+                verified_items.push((idx, (*label).to_string(), v));
             }
             Err(e) => {
                 rejected_peers.push(((*label).to_string(), e.to_string()));
@@ -526,12 +734,14 @@ pub fn compare_peer_certificates(
 
     let admitted: Vec<AdmittedCandidate<'_>> = verified_items
         .iter()
-        .map(|(_, _, v, raw)| AdmittedCandidate {
+        .map(|(_, _, v)| AdmittedCandidate {
             profile: v.tail.checkpoint.bootstrap.profile,
             query_height: v.tail.query_height,
             certified_work: v.tail.total_work,
             header_id: v.tail.query_header_id,
-            canonical_bytes: raw.as_slice(),
+            // Tie-break strictly on the chain commitment (query_header_id), never on malleable
+            // proof bytes / seed trailers (defends against equal-work proof-byte grinding).
+            canonical_bytes: v.tail.query_header_id.as_slice(),
         })
         .collect();
 
@@ -545,7 +755,7 @@ pub fn compare_peer_certificates(
                 && c.canonical_bytes == best.canonical_bytes
         })
         .expect("selected candidate present");
-    let (winner_index, winner_label, winner_v, _) = &verified_items[pos];
+    let (winner_index, winner_label, winner_v) = &verified_items[pos];
 
     Ok(PeerComparisonResult {
         winner_index: *winner_index,
@@ -939,11 +1149,46 @@ mod tests {
             &spent,
             &created,
             Some(&tx_proof),
+            Some(tx_proof.leaf_data),
+            0, // explicit unconfirmed tip check
         )
         .expect("genuine checkpoint block state must verify");
         assert_eq!(ok.height, 1_827_976);
+        assert_eq!(ok.confirmations, 0);
+        assert!(!ok.confirmed_k0);
         assert_eq!(ok.header_chain_len, 2);
         assert!(ok.tx_merkle_verified);
+        assert_eq!(ok.verified_tx_id, Some(tx_proof.leaf_data));
+
+        // Default strict k_0 = 64 confirmations MUST reject 0-confirmation tip!
+        assert!(verify_checkpoint_block_state(
+            &ckpt_1827976,
+            &chain_desc,
+            &ad_bytes,
+            &[],
+            &spent,
+            &created,
+            Some(&tx_proof),
+            Some(tx_proof.leaf_data),
+            PROD128_MIN_CONFIRMATIONS,
+        )
+        .is_err());
+
+        // Requested txId mismatch -> MUST reject fail-closed (GPT-6.2 H2)!
+        let mut wrong_tx_id = tx_proof.leaf_data;
+        wrong_tx_id[0] ^= 0x01;
+        assert!(verify_checkpoint_block_state(
+            &ckpt_1827976,
+            &chain_desc,
+            &ad_bytes,
+            &[],
+            &spent,
+            &created,
+            Some(&tx_proof),
+            Some(wrong_tx_id),
+            0,
+        )
+        .is_err());
 
         // Tamper 1 bit in header[0] -> must reject because BLAKE2b(header[0]) != ckpt.tip_id
         let mut bad_chain = chain_desc.clone();
@@ -956,10 +1201,12 @@ mod tests {
             &spent,
             &created,
             Some(&tx_proof),
+            Some(tx_proof.leaf_data),
+            0,
         )
         .is_err());
 
-        // Downgraded profile checkpoint -> must reject fail-closed
+        // Downgraded profile checkpoint -> must reject fail-closed in BOTH block check & extend_tail!
         let mut bad_ckpt = ckpt_1827976.clone();
         bad_ckpt.bootstrap.profile = ProfileId::V2Production;
         assert!(matches!(
@@ -971,8 +1218,39 @@ mod tests {
                 &spent,
                 &created,
                 Some(&tx_proof),
+                Some(tx_proof.leaf_data),
+                0,
             ),
             Err(LightError::UnsupportedProfile(ProfileId::V2Production))
         ));
+        let mut bad_base_ckpt = ckpt_1827840.clone();
+        bad_base_ckpt.bootstrap.profile = ProfileId::V2Production;
+        assert!(matches!(
+            extend_light_checkpoint_bytes(&bad_base_ckpt, ext_bytes),
+            Err(LightError::UnsupportedProfile(ProfileId::V2Production))
+        ));
+
+        // Future timestamp drift (> now + 20 min) MUST reject fail-closed (Claude H1)!
+        assert!(extend_light_checkpoint_bytes_at_time(&ckpt_1827840, ext_bytes, Some(1_000)).is_err());
+    }
+
+    #[test]
+    fn bounded_gzip_and_u32le_reject_bombs_and_oversized_headers() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // Compress 64 KiB of zeros -> tiny gzip (~100 B), must fail against 1 KiB decompressed cap
+        let mut enc = GzEncoder::new(Vec::new(), Compression::best());
+        enc.write_all(&vec![0u8; 65_536]).unwrap();
+        let gz = enc.finish().unwrap();
+        assert!(gz.len() < 1024);
+        assert!(decompress_if_gzip_bounded(&gz, 4096, 1024).is_err());
+
+        // Oversized header (> 514 B) in u32le frame must fail before allocating
+        let mut bad_u32le = Vec::new();
+        bad_u32le.extend_from_slice(&(600u32).to_le_bytes());
+        bad_u32le.extend_from_slice(&vec![0u8; 600]);
+        assert!(decode_u32le_headers(&bad_u32le).is_err());
     }
 }

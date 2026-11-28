@@ -994,7 +994,7 @@ fn main() {
         std::process::exit(2);
     }
     let path = PathBuf::from(&args[2]);
-    let mut profile = ProfileId::V2Production;
+    let mut profile = ProfileId::V2Production128;
     let mut segment_size = 1024usize;
     let mut export_dir: Option<PathBuf> = None;
 

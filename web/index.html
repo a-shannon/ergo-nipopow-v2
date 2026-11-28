@@ -7,19 +7,22 @@
   <style>
     :root {
       --bg: #0d1117; --card: #161b22; --border: #30363d; --fg: #e6edf3;
-      --muted: #8b949e; --accent: #ff5e18; --ok: #3fb950; --err: #f85149; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      --muted: #8b949e; --accent: #ff5e18; --ok: #3fb950; --warn: #d29922; --err: #f85149;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     }
     body { margin: 0; font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--fg); line-height: 1.5; }
-    main { max-width: 920px; margin: 24px auto; padding: 0 16px 48px; }
+    main { max-width: 940px; margin: 24px auto; padding: 0 16px 48px; }
     h1 { font-size: 1.55rem; margin: 0 0 6px; }
-    .sub { color: var(--muted); margin: 0 0 20px; font-size: 0.95rem; }
+    .sub { color: var(--muted); margin: 0 0 20px; font-size: 0.94rem; }
     .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin-bottom: 16px; }
-    .card h2 { font-size: 1.05rem; margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
+    .card h2 { font-size: 1.05rem; margin: 0 0 10px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
     .badge { font-size: 0.72rem; font-family: var(--mono); padding: 2px 7px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
     .badge.ok { color: var(--ok); border-color: var(--ok); }
+    .badge.warn { color: var(--warn); border-color: var(--warn); }
     .badge.err { color: var(--err); border-color: var(--err); }
     .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 10px; }
     label { font-size: 0.85rem; color: var(--muted); display: flex; flex-direction: column; gap: 4px; flex: 1 1 220px; }
+    label.inline { flex-direction: row; align-items: center; gap: 8px; flex: 1 1 auto; color: var(--fg); font-size: 0.84rem; }
     input[type="text"], input[type="number"], input[type="file"] {
       background: #0d1117; color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 7px 9px; font-family: var(--mono); font-size: 0.82rem;
     }
@@ -30,7 +33,7 @@
     button:disabled { opacity: 0.45; cursor: not-allowed; }
     pre {
       background: #090c10; border: 1px solid var(--border); border-radius: 8px; padding: 12px; overflow-x: auto;
-      font-family: var(--mono); font-size: 0.78rem; color: #c9d1d9; max-height: 320px; margin: 12px 0 0;
+      font-family: var(--mono); font-size: 0.78rem; color: #c9d1d9; max-height: 340px; margin: 12px 0 0;
     }
     .kv { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; margin-top: 10px; }
     .kv div { background: #0d1117; border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; }
@@ -42,8 +45,8 @@
   <main>
     <h1>Ergo NiPoPoW V2 &mdash; Browser WebAssembly Light Client</h1>
     <p class="sub">
-      Strict 128-bit (<code>V2Production128</code>) trustless verification from genesis inside V8 WebAssembly
-      (zero backend, zero prover SDK, zero JS imports, indefinite plain-header continuation).
+      <code>V2Production128</code> trustless verification from genesis inside V8 WebAssembly
+      (zero backend, zero prover SDK, zero JS imports, bounded EIP-0054 decoders; verifies the 128-bit ZisK STIR half in WASM).
       <a href="https://github.com/a-shannon/ergo-nipopow-v2" style="color: var(--accent);">Source &amp; Reproducible VKs</a>
     </p>
 
@@ -53,10 +56,10 @@
         <label>WASM binary (<code>ergo_nipopow_v2_light.wasm</code>)
           <input id="fWasm" type="file" accept=".wasm" />
         </label>
-        <label>Certificate (<code>.npv2.bin</code> or <code>.gz</code>)
+        <label>Certificate (<code>.npv2.bin</code> or <code>.gz</code>, &le; 12 MiB)
           <input id="fCert" type="file" />
         </label>
-        <label>Exact tail (<code>.u32le</code> or <code>.gz</code>)
+        <label>Exact tail (<code>.u32le</code> or <code>.gz</code>, &le; 8 MiB)
           <input id="fTail" type="file" />
         </label>
       </div>
@@ -66,9 +69,9 @@
         <button id="btnClear" class="secondary">Clear Saved Checkpoint</button>
       </div>
       <div class="kv" id="kvState">
-        <div><small>Profile / Backend</small><code id="vProf">-</code></div>
-        <div><small>Certified Tip Height</small><code id="vTip">-</code></div>
-        <div><small>Certified Tip State Root (AVL+)</small><code id="vRoot">-</code></div>
+        <div><small>Profile / Verified Proof</small><code id="vProf">-</code></div>
+        <div><small>Synced Tip / Confirmed (&ge; 64 conf)</small><code id="vTip">-</code></div>
+        <div><small>Tip State Root (AVL+)</small><code id="vRoot">-</code></div>
         <div><small>Audit Draws / Cold Time</small><code id="vPerf">-</code></div>
       </div>
     </section>
@@ -90,13 +93,19 @@
     </section>
 
     <section class="card">
-      <h2>3. Trustless Live Block AVL+ ADProofs &amp; Tx Merkle (Any Certified Height) <span id="b3" class="badge">idle</span></h2>
+      <h2>3. Trustless Live Block AVL+ ADProofs &amp; Tx Merkle (Up to 1,024 Blocks Behind Tip) <span id="b3" class="badge">idle</span></h2>
       <div class="row">
-        <label>Live block height to verify (0 = current certified tip)
+        <label>Live block height (0 = default confirmed height tip &minus; 64)
           <input id="liveBlockHeight" type="number" value="0" min="0" step="1" />
         </label>
-        <label>Tx index or 64-hex txId (optional, default 0)
+        <label>Tx index or 64-hex txId (verified strictly against Merkle leafData)
           <input id="liveTxSel" type="text" value="0" />
+        </label>
+      </div>
+      <div class="row">
+        <label class="inline">
+          <input id="chkUnconfirmed" type="checkbox" />
+          Allow unconfirmed block inspection (&lt; 64 confirmations; default enforces k<sub>0</sub> = 64 confirmations)
         </label>
       </div>
       <div class="row">
@@ -120,10 +129,20 @@
   </main>
 
   <script type="module">
-    const LS_KEY = "ergo_nipopow_v2_checkpoint_v041";
-    const LS_BASE_KEY = "ergo_nipopow_v2_base_checkpoint_v041";
+    import {
+      fetchBoundedBytes,
+      MAX_CERT_COMPRESSED_BYTES,
+      MAX_TAIL_COMPRESSED_BYTES,
+      MAX_WASM_BYTES,
+      PROD128_MIN_CONFIRMATIONS,
+    } from "./nipopow-v2.js";
+
+    const LS_KEY = "ergo_nipopow_v2_checkpoint_v043";
+    const LS_BASE_KEY = "ergo_nipopow_v2_base_checkpoint_v043";
     const worker = new Worker("./worker.js", { type: "module" });
     let nextId = 1;
+    let stateGen = 0;
+    let busy = false;
     const pending = new Map();
     let wasmReady = false;
     let checkpointJson = null;
@@ -142,6 +161,32 @@
       el.textContent = text;
       el.className = `badge ${cls}`;
     }
+    function syncButtons() {
+      const hasCkpt = Boolean(checkpointJson);
+      $("btnCold").disabled = busy;
+      $("btnResume").disabled = busy;
+      $("btnClear").disabled = busy;
+      $("btnLive").disabled = busy || !hasCkpt;
+      $("btnLiveBlock").disabled = busy || !hasCkpt;
+      $("btnAdProof").disabled = busy || !hasCkpt;
+      $("btnTamper").disabled = busy || !hasCkpt;
+    }
+    async function runSerialized(fn) {
+      if (busy) return;
+      busy = true;
+      syncButtons();
+      try {
+        await fn();
+      } finally {
+        busy = false;
+        syncButtons();
+      }
+    }
+
+    $("fWasm").addEventListener("change", () => {
+      wasmReady = false;
+      log("WASM file selection changed; module will reload on next verification.");
+    });
 
     worker.onmessage = (ev) => {
       const { id, ok, result, error, progress } = ev.data;
@@ -164,68 +209,92 @@
       });
     }
 
-    async function loadInputOrFetch(fileInput, fallbackUrls) {
+    async function loadInputOrFetch(fileInput, fallbackUrls, maxBytes) {
       if (fileInput.files && fileInput.files[0]) {
+        if (fileInput.files[0].size > maxBytes) {
+          throw new Error(`Selected file ${fileInput.files[0].name} exceeds cap ${maxBytes} B`);
+        }
         return new Uint8Array(await fileInput.files[0].arrayBuffer());
       }
       const urls = Array.isArray(fallbackUrls) ? fallbackUrls : [fallbackUrls];
-      let lastStatus = "network error";
+      let lastErr = "network error";
       for (const url of urls) {
-        const resp = await fetch(url);
-        if (resp.ok) {
-          return new Uint8Array(await resp.arrayBuffer());
+        try {
+          return await fetchBoundedBytes(url, maxBytes);
+        } catch (e) {
+          lastErr = e.message;
         }
-        lastStatus = `HTTP ${resp.status} for ${url}`;
       }
-      throw new Error(`Select a local file or host ${urls[0]} (${lastStatus})`);
+      throw new Error(`Select a local file or host ${urls[0]} (${lastErr})`);
     }
 
     async function ensureWasm() {
       if (wasmReady) return;
-      const wasmBytes = await loadInputOrFetch($("fWasm"), "./assets/ergo_nipopow_v2_light.wasm");
+      const wasmBytes = await loadInputOrFetch($("fWasm"), "./assets/ergo_nipopow_v2_light.wasm", MAX_WASM_BYTES);
       const info = await callWorker("init", { wasmBytes });
       wasmReady = true;
       log(`WASM instantiated in ${info.instantiateMs.toFixed(1)} ms (${(info.rawBytes / 1024).toFixed(1)} KiB raw, zero JS imports)`);
     }
 
-    function updateCheckpoint(jsonStr, meta = {}) {
+    function updateCheckpoint(jsonStr, meta = {}, expectedGen = stateGen) {
+      if (expectedGen !== stateGen) return;
+      const cp = JSON.parse(jsonStr);
+      if (cp?.bootstrap?.profile !== "V2Production128") {
+        throw new Error(`Refusing checkpoint with non-production profile: ${cp?.bootstrap?.profile}`);
+      }
       checkpointJson = jsonStr;
       localStorage.setItem(LS_KEY, jsonStr);
-      const cp = JSON.parse(jsonStr);
-      $("vTip").textContent = `${cp.tip_height.toLocaleString()} (${cp.tip_id.slice(0, 16)}...)`;
-      $("vRoot").textContent = cp.tip_state_root;
-      if (meta.profile) $("vProf").textContent = `${meta.profile} / ${meta.backend}`;
+      const tipIdHex = Array.isArray(cp.tip_id)
+        ? cp.tip_id.map((b) => b.toString(16).padStart(2, "0")).join("")
+        : String(cp.tip_id || "");
+      const rootHex = Array.isArray(cp.tip_state_root)
+        ? cp.tip_state_root.map((b) => b.toString(16).padStart(2, "0")).join("")
+        : String(cp.tip_state_root || "");
+      const confirmedH = Math.max(0, Number(cp.tip_height) - PROD128_MIN_CONFIRMATIONS);
+      $("vTip").textContent = `${Number(cp.tip_height).toLocaleString()} / <= ${confirmedH.toLocaleString()} (${tipIdHex.slice(0, 12)}..)`;
+      $("vRoot").textContent = rootHex;
+      if (meta.profile) {
+        $("vProf").textContent = `${meta.profile} / ${meta.verifiedProof || meta.backend}`;
+      }
       if (meta.perf) $("vPerf").textContent = meta.perf;
-      $("btnLive").disabled = false;
-      $("btnLiveBlock").disabled = false;
-      $("btnAdProof").disabled = false;
-      $("btnTamper").disabled = false;
+      syncButtons();
     }
 
-    $("btnCold").onclick = async () => {
+    $("btnCold").onclick = () => runSerialized(async () => {
+      const gen = stateGen;
       try {
         setBadge("b1", "verifying...");
         await ensureWasm();
-        const certBytes = await loadInputOrFetch($("fCert"), "./assets/ergo-mainnet-1827840-prod128-zisk-stir.npv2.bin.gz");
-        const tailBytes = await loadInputOrFetch($("fTail"), "./assets/tail-1819645-1827840.u32le.gz");
+        const certBytes = await loadInputOrFetch(
+          $("fCert"),
+          "./assets/ergo-mainnet-1827840-prod128-zisk-stir.npv2.bin.gz",
+          MAX_CERT_COMPRESSED_BYTES
+        );
+        const tailBytes = await loadInputOrFetch(
+          $("fTail"),
+          "./assets/tail-1819645-1827840.u32le.gz",
+          MAX_TAIL_COMPRESSED_BYTES
+        );
         log(`Cold-verifying ${(certBytes.length / 1048576).toFixed(2)} MiB cert + ${(tailBytes.length / 1048576).toFixed(2)} MiB tail...`);
         const res = await callWorker("verifyCert", { certBytes, tailBytes, queryHeight: 1823986 });
+        if (gen !== stateGen) return;
         baseCheckpointJson = res.checkpoint_json;
         localStorage.setItem(LS_BASE_KEY, res.checkpoint_json);
         updateCheckpoint(res.checkpoint_json, {
           profile: res.profile,
           backend: res.backend,
+          verifiedProof: res.verified_proof,
           perf: `${res.audit_draws} draws in ${(res.elapsedMs / 1000).toFixed(3)} s`,
-        });
+        }, gen);
         setBadge("b1", "VERIFIED", "ok");
-        log(`PASS: profile=${res.profile} backend=${res.backend} h=${res.query_height} tip=${res.tip_height} cold=${(res.elapsedMs / 1000).toFixed(3)}s (saved 5.6 KiB LightCheckpoint)`);
+        log(`PASS: profile=${res.profile} container=${res.backend} verified_proof="${res.verified_proof}" openvm_half_verified=${res.openvm_half_verified} h=${res.query_height} tip=${res.tip_height} cold=${(res.elapsedMs / 1000).toFixed(3)}s`);
       } catch (e) {
         setBadge("b1", "FAILED", "err");
         log(`ERROR: ${e.message}`);
       }
-    };
+    });
 
-    $("btnResume").onclick = async () => {
+    $("btnResume").onclick = () => runSerialized(async () => {
       const saved = localStorage.getItem(LS_KEY);
       if (!saved) {
         log("No saved LightCheckpoint in localStorage yet. Run step 1 once.");
@@ -233,58 +302,94 @@
       }
       try {
         await ensureWasm();
+        const parsed = JSON.parse(saved);
+        if (parsed?.bootstrap?.profile !== "V2Production128") {
+          throw new Error(`Stored checkpoint has invalid profile ${parsed?.bootstrap?.profile}; run step 1 again.`);
+        }
         baseCheckpointJson = localStorage.getItem(LS_BASE_KEY) || saved;
-        updateCheckpoint(saved, { profile: "V2Production128", backend: "Resumed LightCheckpoint" });
+        updateCheckpoint(saved, {
+          profile: parsed.bootstrap.profile,
+          verifiedProof: "Resumed localStorage checkpoint (unverified local cache)",
+        });
         setBadge("b1", "RESUMED", "ok");
-        log("Resumed saved 5.6 KiB LightCheckpoint from localStorage (zero STARK download).");
+        log("Resumed saved 5.6 KiB V2Production128 LightCheckpoint from localStorage (zero STARK download).");
       } catch (e) {
+        setBadge("b1", "FAILED", "err");
         log(`ERROR: ${e.message}`);
       }
-    };
+    });
 
     $("btnClear").onclick = () => {
+      if (busy) return;
+      stateGen++;
       localStorage.removeItem(LS_KEY);
       localStorage.removeItem(LS_BASE_KEY);
+      checkpointJson = null;
       baseCheckpointJson = null;
-      log("Cleared saved LightCheckpoint from localStorage.");
+      lastExtBytes = null;
+      $("vProf").textContent = "-";
+      $("vTip").textContent = "-";
+      $("vRoot").textContent = "-";
+      $("vPerf").textContent = "-";
+      setBadge("b1", "idle");
+      setBadge("b2", "idle");
+      setBadge("b3", "idle");
+      syncButtons();
+      log("Cleared saved LightCheckpoint from localStorage and reset active session state.");
     };
 
-    $("btnLive").onclick = async () => {
+    $("btnLive").onclick = () => runSerialized(async () => {
+      const gen = stateGen;
       try {
         setBadge("b2", "syncing...");
         await ensureWasm();
         const nodeUrl = $("nodeUrl").value.trim();
         const count = parseInt($("syncCount").value, 10) || 0;
-        log(`Fetching live headers from untrusted node ${nodeUrl} (zero STARK)...`);
+        log(`Fetching contiguous live headers from untrusted node ${nodeUrl} (zero STARK, +20 min clock guard)...`);
         const res = await callWorker("extendLiveFromNode", { nodeUrl, checkpointJson, count });
-        updateCheckpoint(res.checkpoint_json);
+        updateCheckpoint(res.checkpoint_json, {}, gen);
         setBadge("b2", `TIP ${res.tip_height}`, "ok");
-        log(`EXTEND_TAIL_PASS: ${res.prev_tip_height} -> ${res.tip_height} (+${res.headers_verified} live headers, ${(res.wireBytes / 1024).toFixed(1)} KiB, node tip=${res.nodeTipHeight}) in ${res.elapsedMs.toFixed(1)} ms`);
+        log(`EXTEND_TAIL_PASS: ${res.prev_tip_height} -> ${res.tip_height} (+${res.headers_verified} live headers, ${(res.wireBytes / 1024).toFixed(1)} KiB, node tip=${res.nodeTipHeight}) in ${res.elapsedMs.toFixed(1)} ms (confirmed <= ${res.tip_height - PROD128_MIN_CONFIRMATIONS})`);
       } catch (e) {
         setBadge("b2", "FAILED", "err");
         log(`ERROR: ${e.message}`);
       }
-    };
+    });
 
-    $("btnTamper").onclick = async () => {
+    $("btnTamper").onclick = () => runSerialized(async () => {
       try {
+        setBadge("b2", "testing tamper...");
         await ensureWasm();
+        const baseCkpt = baseCheckpointJson || checkpointJson;
         const ext = lastExtBytes || await loadInputOrFetch($("fExt"), [
           "./assets/extension_1827841_1827976.u32le",
           "../crates/ergo-nipopow-v2-light/testdata/extension_1827841_1827976.u32le",
-        ]);
+        ], MAX_TAIL_COMPRESSED_BYTES);
+        // Step A: Prove genuine un-tampered extension verifies against baseCkpt first!
+        await callWorker("extendTail", { checkpointJson: baseCkpt, extBytes: ext, nowMs: 0 });
+        // Step B: Flip 1 bit in the final PoW nonce -> MUST reject with PoW/tail verification error
         const bad = new Uint8Array(ext);
         bad[bad.length - 1] ^= 0x01;
-        await callWorker("extendTail", { checkpointJson: baseCheckpointJson || checkpointJson, extBytes: bad });
-        setBadge("b2", "BUG: ACCEPTED", "err");
-        log("UNEXPECTED: tampered header accepted!");
-      } catch (e) {
+        let rejectedErr = null;
+        try {
+          await callWorker("extendTail", { checkpointJson: baseCkpt, extBytes: bad, nowMs: 0 });
+        } catch (err) {
+          rejectedErr = err;
+        }
+        if (!rejectedErr) {
+          setBadge("b2", "BUG: ACCEPTED", "err");
+          log("UNEXPECTED: tampered header accepted!");
+          return;
+        }
         setBadge("b2", "TAMPER REJECTED", "ok");
-        log(`FAIL-CLOSED TAMPER REJECTED OK: ${e.message}`);
+        log(`FAIL-CLOSED TAMPER REJECTED OK (baseline passed, 1-bit PoW flip rejected): ${rejectedErr.message}`);
+      } catch (e) {
+        setBadge("b2", "TEST ERROR", "err");
+        log(`TAMPER TEST SETUP ERROR: ${e.message}`);
       }
-    };
+    });
 
-    $("btnLiveBlock").onclick = async () => {
+    $("btnLiveBlock").onclick = () => runSerialized(async () => {
       try {
         setBadge("b3", "fetching & verifying...");
         await ensureWasm();
@@ -292,48 +397,56 @@
         const targetHeight = parseInt($("liveBlockHeight").value, 10) || 0;
         const txRaw = $("liveTxSel").value.trim();
         const txSelector = txRaw.length === 64 ? txRaw : (parseInt(txRaw, 10) || 0);
+        const allowUnconfirmed = $("chkUnconfirmed").checked;
         const cp = JSON.parse(checkpointJson);
-        const hLabel = targetHeight > 0 ? targetHeight : cp.tip_height;
-        log(`Fetching live block ${hLabel} ADProofs + txs + Tx Merkle proof from ${nodeUrl}...`);
+        const hLabel = targetHeight > 0
+          ? targetHeight
+          : (allowUnconfirmed ? cp.tip_height : Math.max(2, cp.tip_height - PROD128_MIN_CONFIRMATIONS));
+        log(`Fetching live block ${hLabel} by certified header ID + ADProofs + Tx Merkle proof from ${nodeUrl}...`);
         const res = await callWorker("verifyLiveBlockFromNode", {
           nodeUrl,
           checkpointJson,
           targetHeight,
           txSelector,
+          allowUnconfirmed,
         });
-        setBadge("b3", `LIVE #${res.height} VERIFIED`, "ok");
-        log(`LIVE_NODE_BLOCK_ADPROOFS_PASS: h=${res.height} (chain=${res.header_chain_len} hdrs from tip ${res.tip_height}) txs=${res.tx_count} ad_bytes=${res.ad_bytes} lookups=${res.lookup_count} spent=${res.spent_count} created=${res.created_count} avl=${res.prev_state_root.slice(0, 12)}..->${res.next_state_root.slice(0, 12)}.. tx=${(res.tx_id || "").slice(0, 12)}.. merkle=${res.tx_merkle_verified} in ${res.elapsedMs.toFixed(1)} ms`);
+        const statusCls = res.confirmed_k0 ? "ok" : "warn";
+        const confTag = res.confirmed_k0
+          ? `CONFIRMED (${res.confirmations} conf)`
+          : `UNCONFIRMED (${res.confirmations} < 64 conf)`;
+        setBadge("b3", `#${res.height} ${confTag}`, statusCls);
+        log(`LIVE_NODE_BLOCK_ADPROOFS_PASS: h=${res.height} [${confTag}] chain=${res.header_chain_len} hdrs ad_bytes=${res.ad_bytes} lookups=${res.lookup_count} spent=${res.spent_count} created=${res.created_count} node_txs=${res.node_reported_tx_count} avl=${res.prev_state_root.slice(0, 12)}..->${res.next_state_root.slice(0, 12)}.. verified_tx=${(res.verified_tx_id || "").slice(0, 16)}.. merkle=${res.tx_merkle_verified} in ${res.elapsedMs.toFixed(1)} ms`);
       } catch (e) {
         setBadge("b3", "FAILED", "err");
         log(`ERROR: ${e.message}`);
       }
-    };
+    });
 
-    $("btnAdProof").onclick = async () => {
+    $("btnAdProof").onclick = () => runSerialized(async () => {
       try {
         setBadge("b3", "verifying...");
         await ensureWasm();
         const extBytes = await loadInputOrFetch($("fExt"), [
           "./assets/extension_1827841_1827976.u32le",
           "../crates/ergo-nipopow-v2-light/testdata/extension_1827841_1827976.u32le",
-        ]);
+        ], MAX_TAIL_COMPRESSED_BYTES);
         const fixtureBytes = await loadInputOrFetch($("fFix"), [
           "./assets/mainnet_1827976_live_state_proof.json",
           "../crates/ergo-nipopow-v2-light/testdata/mainnet_1827976_live_state_proof.json",
-        ]);
+        ], 1024 * 1024);
         lastExtBytes = extBytes;
         const res = await callWorker("verifyLiveStateProof", {
           checkpointJson: baseCheckpointJson || checkpointJson,
           extBytes,
           fixtureBytes,
         });
-        setBadge("b3", "AVL+ VERIFIED", "ok");
-        log(`LIVE_STATE_PROOF_PASS: h=${res.live_height} ad_bytes=${res.ad_bytes} spent=${res.spent_count} created=${res.created_count} avl=${res.prev_state_root.slice(0, 12)}..->${res.next_state_root.slice(0, 12)}.. tx_merkle=${res.tx_merkle_verified} in ${res.elapsedMs.toFixed(1)} ms`);
+        setBadge("b3", "FIXTURE #1827976 OK", "ok");
+        log(`OFFLINE_FIXTURE_STATE_PROOF_PASS: h=${res.live_height} ad_bytes=${res.ad_bytes} spent=${res.spent_count} created=${res.created_count} avl=${res.prev_state_root.slice(0, 12)}..->${res.next_state_root.slice(0, 12)}.. verified_tx=${res.verified_tx_id.slice(0, 16)}.. merkle=${res.tx_merkle_verified} in ${res.elapsedMs.toFixed(1)} ms`);
       } catch (e) {
         setBadge("b3", "FAILED", "err");
         log(`ERROR: ${e.message}`);
       }
-    };
+    });
   </script>
 </body>
 </html>

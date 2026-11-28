@@ -3,9 +3,10 @@
 Zero-dependency strict 128-bit (`V2Production128`) Ergo NiPoPoW V2 WebAssembly light-client verifier for wallets (Nautilus, Minotaur, Fleet SDK dApps), browsers, and Node.js.
 
 - **Zero runtime npm dependencies, zero prover SDK, zero JS WASM imports.**
-- **Cold genesis-to-tip verification** (`1,827,840` mainnet headers in ~4.5 s in V8 from `5.99 MiB` gzip-compressed certificate + tail).
-- **Indefinite plain-header continuation** (`extendTail`, ~160 KiB/day, zero STARK prover dependency).
-- **Trustless live multi-tx AVL+ `ADProofs` & Scorex Tx Merkle verification** (`verifyCheckpointBlockState`, supporting `dataInputs` lookups and intra-block spend cancellation matching `ErgoState.stateChanges`).
+- **Cold genesis-to-tip verification** (`1,827,840` mainnet headers in ~4.4 s in V8 from `5.99 MiB` gzip-compressed certificate + tail; verifies the 128-bit ZisK STIR half and explicitly reports `openvm_half_verified: false` for Dual containers).
+- **Indefinite plain-header continuation** (`extendTail`, ~160 KiB/day, +20 min future-drift guard, zero STARK prover dependency).
+- **Trustless live multi-tx AVL+ `ADProofs` & Scorex Tx Merkle verification** (`verifyCheckpointBlockState`, enforcing `k_0 = 64` confirmation depth by default, `expected_tx_id == leafData` binding, `Some(_)` lookup existence for external `dataInputs`, and intra-block spend cancellation matching `ErgoState.stateChanges`).
+- **WASM binary:** Build `ergo_nipopow_v2_light.wasm` from source (below) or fetch the matching versioned binary from the repository's GitHub Pages / CI artifacts.
 
 ## Build the `.wasm` Binary
 

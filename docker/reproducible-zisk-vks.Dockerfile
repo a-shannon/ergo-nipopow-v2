@@ -46,7 +46,8 @@ RUN mkdir -p /root/.zisk \
   && rm -f /tmp/zisk.tar.gz \
   && ln -sf /root/.zisk/bin/cargo-zisk-cpu /root/.zisk/bin/cargo-zisk \
   && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.91.1 \
-  && /root/.zisk/bin/cargo-zisk-cpu toolchain install || true
+  && /root/.zisk/bin/cargo-zisk-cpu --version \
+  && /root/.zisk/bin/cargo-zisk-cpu toolchain install
 
 WORKDIR /ergo-nipopow-v2
 COPY crates/ergo-nipopow-v2-core ./crates/ergo-nipopow-v2-core

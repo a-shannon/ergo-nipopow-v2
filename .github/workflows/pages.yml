@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
     paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
       - "web/**"
       - "crates/ergo-nipopow-v2-core/**"
       - "crates/ergo-nipopow-v2-light/**"
@@ -31,12 +33,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build wasm32-unknown-unknown verifier (zero JS imports)
+      - name: Build wasm32-unknown-unknown verifier (locked, zero JS imports)
         run: |
-          cargo build -p ergo-nipopow-v2-light --no-default-features --target wasm32-unknown-unknown --release
+          cargo build --locked -p ergo-nipopow-v2-light --no-default-features --target wasm32-unknown-unknown --release
           ls -lh target/wasm32-unknown-unknown/release/ergo_nipopow_v2_light.wasm
 
-      - name: Assemble static _site with verified v0.4.0 .gz release assets (same-origin)
+      - name: Assemble static _site with exact SHA-256 verified v0.4.0 .gz release assets (same-origin)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -46,11 +48,11 @@ jobs:
           cp target/wasm32-unknown-unknown/release/ergo_nipopow_v2_light.wasm _site/assets/
           cp crates/ergo-nipopow-v2-light/testdata/extension_1827841_1827976.u32le _site/assets/
           cp crates/ergo-nipopow-v2-light/testdata/mainnet_1827976_live_state_proof.json _site/assets/
-          gh release download v0.4.0 -R "${{ github.repository }}" -D _site/assets \
+          gh release download v0.4.0 -R "a-shannon/ergo-nipopow-v2" -D _site/assets \
             -p "ergo-mainnet-1827840-prod128-zisk-stir.npv2.bin.gz" \
             -p "tail-1819645-1827840.u32le.gz" \
             -p "SHA256SUMS.txt"
-          (cd _site/assets && sha256sum --ignore-missing -c SHA256SUMS.txt)
+          (cd _site/assets && grep -E '  (ergo-mainnet-1827840-prod128-zisk-stir\.npv2\.bin\.gz|tail-1819645-1827840\.u32le\.gz)$' SHA256SUMS.txt | sha256sum -c -)
           ls -lh _site _site/assets
 
       - uses: actions/configure-pages@v5
